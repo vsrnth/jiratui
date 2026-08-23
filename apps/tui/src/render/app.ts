@@ -55,11 +55,15 @@ function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRend
     const issue = state.filteredIssues[index];
     if (!issue) continue;
     const selected = index === state.selectedIndex;
-    const row = box(ctx, { width: "100%", minWidth: 30, height: 2, flexDirection: "row", paddingLeft: 1, paddingRight: 1 });
+    // A card layout keeps the identity intact at every supported width. In
+    // particular, the key is allowed to wrap instead of being squeezed into a
+    // fixed column or replaced with an ellipsis.
+    const row = box(ctx, { width: "100%", minWidth: 30, height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
     if (selected) row.backgroundColor = C.selected;
-    // The key has no ellipsis and flexShrink 0; only the summary yields space.
-    add(row, text(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: Math.min(18, Math.max(10, issue.key.length + 3)), minWidth: issue.key.length + 3, flexShrink: 0 }));
-    add(row, text(ctx, issue.summary, { fg: C.fg, flexGrow: 1, flexShrink: 1, width: "auto" }));
+    add(row, text(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: "100%", wrapMode: "char" }));
+    add(row, text(ctx, `${issue.status} · ${issue.priority} · ${issue.assignee}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(row, text(ctx, `Updated ${issue.updated}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(row, text(ctx, issue.summary, { fg: C.fg, width: "100%", wrapMode: "word" }));
     add(scroll, row);
   }
   if (state.filteredIssues.length === 0) add(scroll, text(ctx, state.search ? `No issues match “${state.search}”` : "No assigned or watched issues", { fg: C.dim, paddingLeft: 1 }));
@@ -72,15 +76,24 @@ function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRen
   if (state.detailLoading) { add(scroll, text(ctx, "Loading issue detail…", { fg: C.warn, paddingLeft: 1 })); return scroll; }
   if (state.detailError) { add(scroll, text(ctx, state.detailError, { fg: C.error, paddingLeft: 1 })); return scroll; }
   if (!state.detail) { add(scroll, text(ctx, "Select an issue and press Enter.", { fg: C.dim, paddingLeft: 1 })); return scroll; }
-  add(scroll, text(ctx, state.detail.issue.summary, { fg: C.accent, paddingLeft: 1 }));
-  add(scroll, text(ctx, `${state.detail.issue.status} · ${state.detail.issue.priority} · ${state.detail.issue.assignee}`, { fg: C.dim, paddingLeft: 1 }));
-  add(scroll, text(ctx, `${state.detail.issue.key} · ${state.detail.issue.updated}`, { fg: C.dim, paddingLeft: 1 }));
+  const detailText = (content: string, color = C.fg, paddingLeft = 1): void => add(scroll, text(ctx, content, { fg: color, paddingLeft, width: "100%", wrapMode: "word" }));
+  detailText(state.detail.issue.summary, C.accent);
+  detailText(`${state.detail.remote ? "REMOTE" : "WORKSPACE"} · ${state.detail.issue.key}`, C.blue);
+  detailText(`${state.detail.issue.status} · ${state.detail.issue.priority} · ${state.detail.issue.assignee}`, C.dim);
+  detailText(`Type: ${state.detail.issueType}`);
+  detailText(`Reporter: ${state.detail.reporter}`);
+  detailText(`Project: ${state.detail.project}`);
+  detailText(`Parent: ${state.detail.parent ?? "None"}`);
+  detailText(`Labels: ${state.detail.labels.length ? state.detail.labels.join(", ") : "None"}`);
+  detailText(`Due: ${state.detail.dueDate ?? "None"}`);
+  detailText(`Created: ${state.detail.created}`);
+  detailText(`Updated: ${state.detail.issue.updated}`);
   add(scroll, text(ctx, "DESCRIPTION", { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
-  add(scroll, text(ctx, state.detail.description || "(no description)", { fg: C.fg, paddingLeft: 1, width: "100%" }));
+  detailText(state.detail.description || "(no description)");
   add(scroll, text(ctx, `COMMENTS (${state.detail.comments.length})`, { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
-  for (const comment of state.detail.comments) { add(scroll, text(ctx, `${comment.author} · ${comment.created}`, { fg: C.dim, paddingLeft: 1 })); add(scroll, text(ctx, comment.body, { fg: C.fg, paddingLeft: 2 })); }
+  for (const comment of state.detail.comments) { detailText(`${comment.author} · ${comment.created}`, C.dim); detailText(comment.body, C.fg, 2); }
   add(scroll, text(ctx, `ATTACHMENTS (${state.detail.attachments.length})`, { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
-  for (const attachment of state.detail.attachments) add(scroll, text(ctx, `${attachment.filename} · ${attachment.mimeType} · ${attachment.sizeBytes} bytes`, { fg: C.dim, paddingLeft: 1 }));
+  for (const attachment of state.detail.attachments) detailText(`${attachment.filename} · ${attachment.mimeType} · ${attachment.sizeBytes} bytes`, C.dim);
   return scroll;
 }
 
