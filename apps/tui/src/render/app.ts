@@ -1,6 +1,7 @@
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer, type Renderable } from "@opentui/core";
 import { maskedSecret } from "../secure-input";
-import type { RootState } from "../state";
+import { STATUS_CATEGORIES, type RootState } from "../state";
+import type { StatusCategory } from "../protocol";
 
 const C = { fg: "#e6e1d6", dim: "#9b978d", accent: "#7dd3a3", blue: "#8ab4f8", warn: "#f2c97d", error: "#f28b82", bg: "#171817", panel: "#20221f", selected: "#2d3d35", border: "#59635b" };
 
@@ -12,6 +13,16 @@ function text(ctx: Context, content: string, options: ConstructorParameters<type
   return new TextRenderable(ctx, { content, flexShrink: 0, ...options });
 }
 function add(parent: Renderable, child: Renderable): void { parent.add(child); }
+
+function statusCategoryLabel(category: StatusCategory): string {
+  return category === "to_do" ? "To Do" : category === "in_progress" ? "In Progress" : category === "done" ? "Done" : "Uncategorized";
+}
+
+function statusFilterLabel(filter: readonly StatusCategory[]): string {
+  if (filter.length === 0) return "All";
+  if (filter.length === 1 && filter[0]) return statusCategoryLabel(filter[0]);
+  return `${filter.length} statuses`;
+}
 
 function clearRoot(renderer: Context): void {
   for (const child of renderer.root.getChildren()) child.destroy();
@@ -27,7 +38,7 @@ function titleBar(ctx: Context, state: RootState): BoxRenderable {
 
 function footer(ctx: Context, state: RootState): BoxRenderable {
   const footer = box(ctx, { width: "100%", height: 2, backgroundColor: C.panel, paddingLeft: 1, flexDirection: "row", alignItems: "center" });
-  add(footer, text(ctx, state.lastMessage ?? "? Help   e Events   / Search   l Lookup   r Refresh   Enter Detail   q Quit", { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
+  add(footer, text(ctx, state.lastMessage ?? "? Help   e Events   / Search   s Status filter   l Lookup   r Refresh   Enter Detail   q Quit", { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
   add(footer, text(ctx, `${state.focus} · ${state.layout.mode}`, { fg: C.dim, width: 24 }));
   return footer;
 }
@@ -49,7 +60,8 @@ function onboarding(ctx: Context, state: RootState): BoxRenderable {
 }
 
 function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRenderable {
-  const scroll = new ScrollBoxRenderable(ctx, { width, height: "100%", border: true, borderColor: state.focus === "List" ? C.accent : C.border, title: ` ISSUES (${state.filteredIssues.length}) `, scrollY: true, flexShrink: 0 });
+  const filterLabel = statusFilterLabel(state.statusFilter);
+  const scroll = new ScrollBoxRenderable(ctx, { width, height: "100%", border: true, borderColor: state.focus === "List" ? C.accent : C.border, title: ` ISSUES (${state.filteredIssues.length}) · FILTER: ${filterLabel} `, scrollY: true, flexShrink: 0 });
   scroll.scrollTop = state.scroll.list;
   for (let index = 0; index < state.filteredIssues.length; index += 1) {
     const issue = state.filteredIssues[index];
@@ -66,8 +78,30 @@ function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRend
     add(row, text(ctx, issue.summary, { fg: C.fg, width: "100%", wrapMode: "word" }));
     add(scroll, row);
   }
-  if (state.filteredIssues.length === 0) add(scroll, text(ctx, state.search ? `No issues match “${state.search}”` : "No assigned or watched issues", { fg: C.dim, paddingLeft: 1 }));
+  if (state.filteredIssues.length === 0) {
+    const empty = state.search && state.statusFilter.length > 0
+      ? `No issues match “${state.search}” in ${filterLabel}`
+      : state.search
+        ? `No issues match “${state.search}”`
+        : state.statusFilter.length > 0
+          ? `No ${filterLabel} issues`
+          : "No assigned or watched issues";
+    add(scroll, text(ctx, empty, { fg: C.dim, paddingLeft: 1, wrapMode: "word", width: "100%" }));
+  }
   return scroll;
+}
+
+function statusPicker(ctx: Context, state: RootState): BoxRenderable {
+  const panel = box(ctx, { position: "absolute", top: 3, left: 6, width: "48%", height: 10, zIndex: 8, backgroundColor: C.bg, border: true, borderColor: C.accent, padding: 1, title: " STATUS FILTER " });
+  add(panel, text(ctx, "Space toggle · Enter apply · Esc cancel", { fg: C.dim }));
+  for (let index = 0; index < STATUS_CATEGORIES.length; index += 1) {
+    const category = STATUS_CATEGORIES[index];
+    if (!category) continue;
+    const selected = index === state.statusPickerIndex;
+    const checked = state.statusDraft.includes(category);
+    add(panel, text(ctx, `${selected ? "▸" : " "} [${checked ? "x" : " "}] ${statusCategoryLabel(category)}`, { fg: selected ? C.accent : C.fg }));
+  }
+  return panel;
 }
 
 function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRenderable {
@@ -151,7 +185,7 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
         add(main, issueList(renderer, state, listWidth));
         if (state.layout.detail && state.layout.mode !== "one-pane") add(main, detailView(renderer, state, state.layout.detail.width));
       }
-      if (state.focus === "Picker") add(main, text(renderer, `Exact issue key: ${state.lookupEditor || "_"}`, { fg: C.accent, position: "absolute", top: 0, left: 1, zIndex: 5 }));
+      if (state.focus === "Picker" && state.pickerMode !== "status") add(main, text(renderer, `Exact issue key: ${state.lookupEditor || "_"}`, { fg: C.accent, position: "absolute", top: 0, left: 1, zIndex: 5 }));
       if (state.layout.event) {
         const log = new ScrollBoxRenderable(renderer, { width: state.layout.event.width, height: "100%", border: true, borderColor: C.border, title: " EVENTS ", scrollY: true, flexShrink: 0 });
         log.scrollTop = state.scroll.eventLog; for (const item of state.events) add(log, text(renderer, `${item.kind}: ${item.message}`, { fg: C.dim })); add(main, log);
@@ -160,7 +194,8 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
     add(root, main);
   }
   add(root, footer(renderer, state));
-  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "/ Search locally", "l Exact issue-key lookup", "r Refresh from Jira", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus));
+  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus));
   if (state.overlays.eventLog) add(root, overlay(renderer, "EVENT LOG", state.events.map((item) => `${item.at} ${item.kind}: ${item.message}`), state.focus));
+  if (state.focus === "Picker" && state.pickerMode === "status") add(root, statusPicker(renderer, state));
   renderer.root.add(root);
 }

@@ -102,4 +102,31 @@ describe("OpenTUI frames", () => {
     expect(frame).toContain("60x19");
     expect(frame).toContain("minimum 60x20");
   });
+
+  test("renders the applied status filter and draft picker", async () => {
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      let state = initialState({ width: 120, height: 40 });
+      state = reduce(state, { type: "workspace_snapshot", siteLabel: "example.atlassian.net", identity: "Ada", issues: [issue], source: "cache", refreshedAt: "now", generation: 0 });
+      state = reduce(state, { type: "open_status_picker" });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const pickerFrame = setup.captureCharFrame();
+      expect(pickerFrame).toContain("STATUS FILTER");
+      expect(pickerFrame).toContain("To Do");
+      expect(pickerFrame).toContain("In Progress");
+
+      state = reduce(state, { type: "move_status_picker", delta: 1 });
+      state = reduce(state, { type: "toggle_status_draft" });
+      state = reduce(state, { type: "apply_status_filter" });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const appliedFrame = setup.captureCharFrame();
+      expect(appliedFrame).toContain("FILTER: In Progress");
+      expect(appliedFrame).toContain("EXTRAORDINARILY_LONG_PROJECT_KEY-1234");
+      expect(appliedFrame).toContain("56789");
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
 });

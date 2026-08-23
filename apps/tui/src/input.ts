@@ -64,6 +64,14 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     }
     return { state, command: null };
   }
+  if (state.focus === "Picker" && state.pickerMode === "status") {
+    if (name === "escape") return { state: reduce(state, { type: "cancel_status_filter" }), command: null };
+    if (name === "enter") return { state: reduce(state, { type: "apply_status_filter" }), command: null };
+    if (name === "up" || name === "k") return { state: reduce(state, { type: "move_status_picker", delta: -1 }), command: null };
+    if (name === "down" || name === "j") return { state: reduce(state, { type: "move_status_picker", delta: 1 }), command: null };
+    if (name === "space" || key.sequence === " ") return { state: reduce(state, { type: "toggle_status_draft" }), command: null };
+    return { state, command: null };
+  }
   if (state.focus === "Search") {
     if (name === "backspace") return { state: reduce(state, { type: "set_search", value: state.search.slice(0, -1) }), command: null };
     const searchText = key.sequence ?? "";
@@ -87,6 +95,7 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
   if (name === "q" && !key.ctrl) return { state, command: "quit" };
   if (name === "?" || (name === "/" && key.ctrl)) return { state: reduce(state, { type: "toggle_help" }), command: null };
   if (name === "e") return { state: reduce(state, { type: "toggle_event_log" }), command: null };
+  if (name === "s" && state.section === "issues") return { state: reduce(state, { type: "open_status_picker" }), command: null };
   if (name === "tab") return { state: moveFocus(state, key.shift ? -1 : 1), command: null };
   if (name === "escape") return { state: reduce(state, { type: "set_focus", focus: "List" }), command: null };
   if (name === "up" || name === "k") return { state: reduce(state, { type: "move_selection", delta: -1 }), command: null };

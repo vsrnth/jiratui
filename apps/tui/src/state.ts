@@ -1,11 +1,14 @@
 import { clampIndex, layoutFor, type Layout, type LayoutMode, type TerminalSize } from "./layout";
 import { backspaceSecret, emptySecret, type SecretEditor } from "./secure-input";
-import type { IssueDetail, IssueSummary } from "./protocol";
+import type { IssueDetail, IssueSummary, StatusCategory } from "./protocol";
 
 export type Focus = "Nav" | "Search" | "List" | "Detail" | "Composer" | "Picker" | "Settings" | "Help" | "EventLog";
 export type Section = "issues" | "updates" | "team" | "settings";
 export type ThemeMode = "System" | "Light" | "Dark";
 export type Phase = "onboarding" | "loading" | "ready" | "error";
+export type PickerMode = "lookup" | "status" | null;
+
+export const STATUS_CATEGORIES: readonly StatusCategory[] = ["to_do", "in_progress", "done", "uncategorized"];
 
 export type Onboarding = {
   baseUrl: string;
@@ -33,6 +36,10 @@ export type RootState = {
   issues: IssueSummary[];
   filteredIssues: IssueSummary[];
   search: string;
+  statusFilter: StatusCategory[];
+  statusDraft: StatusCategory[];
+  statusPickerIndex: number;
+  pickerMode: PickerMode;
   lookupEditor: string;
   selectedIndex: number;
   selectedIssueKey: string | null;
@@ -58,7 +65,7 @@ export function initialState(size: TerminalSize = { width: 120, height: 40 }): R
     phase: "onboarding", sessionId: session(), section: "issues", focus: "Nav", size, layout: layoutFor(size),
     theme: "System", detectedTheme: null, siteLabel: null, identity: null,
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
-    issues: [], filteredIssues: [], search: "", lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
+    issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
     detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
     generations: { refresh: 0, detail: 0, lookup: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
     scroll: { list: 0, detail: 0, updates: 0, team: 0, eventLog: 0 }, events: [], lastMessage: null,
@@ -87,6 +94,11 @@ export type Action =
   | { type: "detail_result"; issue: IssueDetail; issueKey: string; generation: number }
   | { type: "detail_error"; message: string; generation: number }
   | { type: "set_search"; value: string }
+  | { type: "open_status_picker" }
+  | { type: "move_status_picker"; delta: number }
+  | { type: "toggle_status_draft" }
+  | { type: "apply_status_filter" }
+  | { type: "cancel_status_filter" }
   | { type: "set_lookup"; value: string }
   | { type: "confirm_forget_login"; value: boolean }
   | { type: "move_selection"; delta: number }
@@ -98,10 +110,32 @@ function withEvent(state: RootState, kind: string, message: string): RootState {
   return { ...state, lastMessage: message, events: [...state.events, event(kind, message)].slice(-64) };
 }
 
-function filterIssues(issues: readonly IssueSummary[], search: string): IssueSummary[] {
+function filterIssues(issues: readonly IssueSummary[], search: string, statusFilter: readonly StatusCategory[] = []): IssueSummary[] {
   const needle = search.trim().toLocaleLowerCase();
-  if (!needle) return issues.slice();
-  return issues.filter((issue) => [issue.key, issue.summary, issue.status, issue.priority, issue.assignee].some((value) => value.toLocaleLowerCase().includes(needle)));
+  return issues.filter((issue) => {
+    const matchesSearch = !needle || [issue.key, issue.summary, issue.status, issue.priority, issue.assignee].some((value) => value.toLocaleLowerCase().includes(needle));
+    const matchesStatus = statusFilter.length === 0 || statusFilter.includes(issue.statusCategory);
+    return matchesSearch && matchesStatus;
+  });
+}
+
+function selectedIssue(state: RootState, filtered: readonly IssueSummary[]): RootState {
+  const previousKey = state.selectedIssueKey;
+  const preservedIndex = previousKey ? filtered.findIndex((issue) => issue.key === previousKey) : -1;
+  const index = preservedIndex >= 0 ? preservedIndex : 0;
+  const selectedIssueKey = filtered[index]?.key ?? null;
+  if (selectedIssueKey === previousKey) return { ...state, filteredIssues: [...filtered], selectedIndex: index, selectedIssueKey };
+  const hasDetailOperation = state.detail !== null || state.detailLoading || state.detailError !== null;
+  return {
+    ...state,
+    filteredIssues: [...filtered],
+    selectedIndex: index,
+    selectedIssueKey,
+    detail: null,
+    detailLoading: false,
+    detailError: null,
+    generations: hasDetailOperation ? { ...state.generations, detail: state.generations.detail + 1 } : state.generations,
+  };
 }
 
 export function reduce(state: RootState, action: Action): RootState {
@@ -129,8 +163,8 @@ export function reduce(state: RootState, action: Action): RootState {
     case "authenticated": return withEvent({ ...state, phase: "loading", siteLabel: action.siteLabel, identity: action.identity }, "auth", "Authenticated");
     case "workspace_snapshot": {
       if (action.generation !== state.generations.refresh) return state;
-      const filtered = filterIssues(action.issues, state.search);
-      return withEvent({ ...state, phase: "ready", siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], filteredIssues: filtered, selectedIndex: clampIndex(state.selectedIndex, filtered.length), selectedIssueKey: filtered[clampIndex(state.selectedIndex, filtered.length)]?.key ?? null, refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt }, "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
+      const filtered = filterIssues(action.issues, state.search, state.statusFilter);
+      return withEvent(selectedIssue({ ...state, phase: "ready", siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt }, filtered), "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
     }
     case "refresh_start": return { ...state, refreshLoading: true, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_error": return action.generation === state.generations.refresh ? withEvent({ ...state, refreshLoading: false }, "refresh", action.message) : state;
@@ -138,10 +172,26 @@ export function reduce(state: RootState, action: Action): RootState {
     case "detail_result": return action.generation === state.generations.detail && action.issueKey === state.selectedIssueKey ? { ...state, detailLoading: false, detail: action.issue, detailError: null, scroll: { ...state.scroll, detail: 0 } } : state;
     case "detail_error": return action.generation === state.generations.detail ? withEvent({ ...state, detailLoading: false, detailError: action.message }, "detail", action.message) : state;
     case "set_search": {
-      const filtered = filterIssues(state.issues, action.value);
-      const index = clampIndex(state.selectedIndex, filtered.length);
-      return { ...state, search: action.value, filteredIssues: filtered, selectedIndex: index, selectedIssueKey: filtered[index]?.key ?? null };
+      const filtered = filterIssues(state.issues, action.value, state.statusFilter);
+      return selectedIssue({ ...state, search: action.value }, filtered);
     }
+    case "open_status_picker": return { ...state, focus: "Picker", pickerMode: "status", statusDraft: [...state.statusFilter], statusPickerIndex: 0 };
+    case "move_status_picker": {
+      const index = clampIndex(state.statusPickerIndex + action.delta, STATUS_CATEGORIES.length);
+      return { ...state, statusPickerIndex: index };
+    }
+    case "toggle_status_draft": {
+      const category = STATUS_CATEGORIES[state.statusPickerIndex];
+      if (!category) return state;
+      const draft = state.statusDraft.includes(category) ? state.statusDraft.filter((item) => item !== category) : [...state.statusDraft, category];
+      return { ...state, statusDraft: draft };
+    }
+    case "apply_status_filter": {
+      const statusFilter = [...state.statusDraft];
+      const filtered = filterIssues(state.issues, state.search, statusFilter);
+      return selectedIssue({ ...state, statusFilter, statusDraft: [...statusFilter], pickerMode: null, focus: "List" }, filtered);
+    }
+    case "cancel_status_filter": return { ...state, statusDraft: [...state.statusFilter], pickerMode: null, focus: "List" };
     case "set_lookup": return { ...state, lookupEditor: action.value };
     case "confirm_forget_login": return { ...state, confirmForgetLogin: action.value };
     case "move_selection": {

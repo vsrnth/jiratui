@@ -71,6 +71,18 @@ describe("key handling", () => {
     const editing = handleKey({ ...result.state, focus: "Picker" }, { name: "A", sequence: "A" }).state;
     expect(editing.lookupEditor).toBe("A");
   });
+  test("opens the status picker with s and applies on OpenTUI return", () => {
+    const issues = [{ id: "1" as never, key: "ABC-1" as never, summary: "Progress", status: "In Progress", statusCategory: "in_progress" as const, priority: "Medium", assignee: "Ada", updated: "now" }];
+    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    state = { ...state, phase: "ready", focus: "List" };
+    let result = handleKey(state, { name: "s", sequence: "s" });
+    expect(result.state.pickerMode).toBe("status");
+    result = handleKey(result.state, { name: "down", sequence: "\u001b[B" });
+    result = handleKey(result.state, { name: "space", sequence: " " });
+    result = handleKey(result.state, { name: "return", sequence: "\r" });
+    expect(result.state.statusFilter).toEqual(["in_progress"]);
+    expect(result.state.focus).toBe("List");
+  });
   test("requires explicit confirmation before deleting a saved login", () => {
     const settings = reduce({ ...initialState(), phase: "ready" }, { type: "set_section", section: "settings" });
     const prompt = handleKey(settings, { name: "f", sequence: "f" });
