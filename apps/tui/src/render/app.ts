@@ -42,7 +42,7 @@ function onboarding(ctx: Context, state: RootState): BoxRenderable {
     add(row, text(ctx, value || "(required)", { fg: value ? C.fg : C.dim }));
     add(panel, row);
   }
-  add(panel, text(ctx, "Tab/Shift-Tab field   Enter advance/connect   Space toggle remember", { fg: C.dim }));
+  add(panel, text(ctx, "Tab/Shift-Tab field   Enter advance/connect   Space toggle remember   Paste supported in token field", { fg: C.dim }));
   if (state.onboarding.submitting) add(panel, text(ctx, "Checking credentials…", { fg: C.warn }));
   if (state.onboarding.error) add(panel, text(ctx, `Error: ${state.onboarding.error}`, { fg: C.error }));
   return panel;

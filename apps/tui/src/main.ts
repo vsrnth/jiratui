@@ -1,7 +1,8 @@
-import { createCliRenderer, type CliRenderer, type KeyEvent } from "@opentui/core";
+import { createCliRenderer, type CliRenderer, type KeyEvent, type PasteEvent } from "@opentui/core";
 import { BackendError, JiraDeskBackend } from "./backend";
 import { handleKey } from "./input";
 import { renderApp } from "./render/app";
+import { pasteSecret } from "./secure-input";
 import { reduce, initialState, type Action, type RootState } from "./state";
 import { parseIssueKey } from "./protocol";
 
@@ -17,6 +18,7 @@ export async function run(): Promise<void> {
   let quitting = false;
   let dispatch = (action: Action): void => { state = reduce(state, action); dirty = true; };
   let onKey: ((key: KeyEvent) => void) | null = null;
+  let onPaste: ((event: PasteEvent) => void) | null = null;
   let onResize: (() => void) | null = null;
   let onThemeMode: ((mode: unknown) => void) | null = null;
   let connectController: AbortController | null = null;
@@ -72,6 +74,17 @@ export async function run(): Promise<void> {
       return false;
     };
     renderer.keyInput.on("keypress", onKey);
+    onPaste = (event) => {
+      if (state.phase !== "onboarding" || state.onboarding.field !== "token") return;
+      event.preventDefault();
+      event.stopPropagation();
+      const token = pasteSecret(state.onboarding.token, event.bytes);
+      if (token.value === state.onboarding.token.value && token.cursor === state.onboarding.token.cursor) return;
+      state = { ...state, onboarding: { ...state.onboarding, token, error: null } };
+      dirty = true;
+      draw();
+    };
+    renderer.keyInput.on("paste", onPaste);
     onResize = () => { dispatch({ type: "resize", size: { width: renderer?.width ?? process.stdout.columns ?? 1, height: renderer?.height ?? process.stdout.rows ?? 1 } }); };
     process.on("SIGWINCH", onResize);
     // OpenTUI emits terminal theme changes; manual overrides remain respected by state.
@@ -98,6 +111,7 @@ export async function run(): Promise<void> {
     cancelOperations();
     if (pollingTimer !== null) clearTimeout(pollingTimer);
     if (renderer && onKey) renderer.keyInput.off("keypress", onKey);
+    if (renderer && onPaste) renderer.keyInput.off("paste", onPaste);
     if (renderer && onThemeMode) renderer.off("theme_mode", onThemeMode);
     if (renderer && onResize) renderer.off("resize", onResize);
     if (onResize) process.off("SIGWINCH", onResize);
