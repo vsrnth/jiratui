@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createTestRenderer } from "@opentui/core/testing";
 import { handleKey, parseSequence } from "../src/input";
 import { initialState, reduce } from "../src/state";
 
@@ -25,6 +26,44 @@ describe("key handling", () => {
     expect(state.onboarding.field).toBe("email");
     state = handleKey(state, { name: "enter", sequence: "\r" }).state;
     expect(state.onboarding.field).toBe("token");
+  });
+  test("normalizes return and linefeed events throughout onboarding", () => {
+    let state = initialState();
+    state = handleKey(state, { name: "return", sequence: "\r" }).state;
+    expect(state.onboarding.field).toBe("email");
+    state = handleKey(state, { name: "linefeed", sequence: "\n" }).state;
+    expect(state.onboarding.field).toBe("token");
+
+    expect(handleKey(state, { name: "return", sequence: "\r" }).command).toBe("connect");
+    state = reduce(state, { type: "onboarding_field", field: "remember" });
+    expect(handleKey(state, { name: "linefeed", sequence: "\n" }).command).toBe("connect");
+  });
+
+  test("OpenTUI's parsed return event triggers connect from a populated token field", async () => {
+    const setup = await createTestRenderer({ width: 80, height: 24 });
+    let listener: ((event: Parameters<typeof setup.renderer.keyInput.emit>[1]) => void) | null = null;
+    try {
+      let state = initialState();
+      state = reduce(state, { type: "onboarding_text", value: "https://example.atlassian.net" });
+      state = reduce(state, { type: "onboarding_field", field: "email" });
+      state = reduce(state, { type: "onboarding_text", value: "ada@example.test" });
+      state = reduce(state, { type: "onboarding_field", field: "token" });
+      state = reduce(state, { type: "onboarding_token", value: "secret-token" });
+      let command: ReturnType<typeof handleKey>["command"] = null;
+      listener = (event) => {
+        const result = handleKey(state, event);
+        state = result.state;
+        command = result.command;
+      };
+      setup.renderer.keyInput.on("keypress", listener);
+      setup.mockInput.pressEnter();
+      await setup.renderOnce();
+      expect(command as "connect" | null).toBe("connect");
+      expect(state.onboarding.token.value).toBe("secret-token");
+    } finally {
+      if (listener) setup.renderer.keyInput.off("keypress", listener);
+      setup.renderer.destroy();
+    }
   });
   test("exact lookup has a dedicated editor", () => {
     const result = handleKey({ ...initialState(), phase: "ready", focus: "List" }, { name: "l", sequence: "l" });

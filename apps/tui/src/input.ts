@@ -7,7 +7,10 @@ export type InputResult = { state: RootState; command: InputCommand };
 const focusOrder: Focus[] = ["Nav", "Search", "List", "Detail", "Composer", "Picker", "Settings"];
 
 export function keyName(key: KeyLike): string {
-  if (key.name) return key.name.toLowerCase();
+  if (key.name) {
+    const name = key.name.toLowerCase();
+    return name === "return" || name === "linefeed" ? "enter" : name;
+  }
   if (key.sequence === "\u001b") return "escape";
   return key.sequence ?? "";
 }
