@@ -1,0 +1,23 @@
+{
+  "name": "jira-desk-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.0",
+  "engines": {
+    "bun": ">=1.4.0 <2"
+  },
+  "scripts": {
+    "build": "bun build apps/tui/src/main.ts --outdir apps/tui/dist --target bun --external @opentui/core",
+    "start": "bun apps/tui/src/main.ts",
+    "test": "bun test apps/tui/test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.9.3"
+  }
+}
