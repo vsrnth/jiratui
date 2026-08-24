@@ -1,6 +1,6 @@
 import { createCliRenderer, type CliRenderer, type KeyEvent, type PasteEvent } from "@opentui/core";
 import { BackendError, JiraDeskBackend } from "./backend";
-import { handleKey } from "./input";
+import { handleKey, pasteJqlScope } from "./input";
 import { renderApp } from "./render/app";
 import { pasteSecret } from "./secure-input";
 import { reduce, initialState, type Action, type RootState } from "./state";
@@ -24,13 +24,33 @@ export async function run(): Promise<void> {
   let connectController: AbortController | null = null;
   let refreshController: AbortController | null = null;
   let detailController: AbortController | null = null;
+  let scopeController: AbortController | null = null;
   let pollingTimer: ReturnType<typeof setTimeout> | null = null;
   let pollingFailures = 0;
+  let pollingSuspended = false;
+
+  const clearPollingTimer = (): void => {
+    if (pollingTimer !== null) clearTimeout(pollingTimer);
+    pollingTimer = null;
+  };
+
+  const suspendPolling = (): void => {
+    pollingSuspended = true;
+    clearPollingTimer();
+  };
+
+  const resumePolling = (): void => {
+    pollingSuspended = false;
+    if (!quitting && !state.scopeSaving) schedulePoll();
+  };
 
   const schedulePoll = (delay = 5 * 60_000): void => {
-    if (pollingTimer !== null) clearTimeout(pollingTimer);
+    clearPollingTimer();
+    if (pollingSuspended || state.scopeSaving || quitting) return;
     pollingTimer = setTimeout(() => {
+      pollingTimer = null;
       if (quitting) return;
+      if (pollingSuspended || state.scopeSaving) return;
       if (state.refreshLoading) {
         schedulePoll(30_000);
         return;
@@ -44,6 +64,7 @@ export async function run(): Promise<void> {
     connectController?.abort();
     refreshController?.abort();
     detailController?.abort();
+    scopeController?.abort();
   };
 
   try {
@@ -65,10 +86,12 @@ export async function run(): Promise<void> {
       if (result.command === "persist_updates") { persistUpdates(); return true; }
       if (result.command === "quit") { quit(); return true; }
       if (result.command === "cancel_connect") { connectController?.abort(); connectController = null; return true; }
+      if (result.command === "cancel_scope_save") { scopeController?.abort(); scopeController = null; resumePolling(); return true; }
       if (result.command === "retry_resize") { dispatch({ type: "resize", size: { width: renderer?.width ?? 1, height: renderer?.height ?? 1 } }); return true; }
       if (result.command === "connect") { void connect(); return true; }
       if (result.command === "refresh") { void refresh(); return true; }
       if (result.command === "save_appearance") { saveAppearancePreferences(); return true; }
+      if (result.command === "save_jql_scope") { void saveJqlScope(); return true; }
       if (result.command === "reload_preferences") { reloadPreferences(); return true; }
       if (result.command === "detail") { void loadDetail(); return true; }
       if (result.command === "focus_search") { return true; }
@@ -79,6 +102,13 @@ export async function run(): Promise<void> {
     };
     renderer.keyInput.on("keypress", onKey);
     onPaste = (event) => {
+      if (state.section === "settings" && state.scopeEditing && !state.scopeSaving) {
+        event.preventDefault();
+        event.stopPropagation();
+        const value = pasteJqlScope(state.scopeDraft, event.bytes);
+        if (value !== null) dispatch({ type: "scope_edit_insert", value });
+        return;
+      }
       if (state.phase !== "onboarding" || state.onboarding.field !== "token") return;
       event.preventDefault();
       event.stopPropagation();
@@ -168,6 +198,7 @@ export async function run(): Promise<void> {
   }
 
   async function refresh(automatic = false): Promise<void> {
+    if (state.scopeSaving || pollingSuspended) return;
     const generation = state.generations.refresh;
     refreshController?.abort();
     const controller = new AbortController();
@@ -189,6 +220,36 @@ export async function run(): Promise<void> {
         clearTimeout(pollingTimer);
         pollingTimer = null;
       }
+    }
+  }
+
+  async function saveJqlScope(): Promise<void> {
+    if (state.scopeSaving) return;
+    suspendPolling();
+    // A scope switch changes the workspace atomically. Invalidate any detail
+    // or refresh completion that belongs to the previous workspace first.
+    refreshController?.abort();
+    detailController?.abort();
+    dispatch({ type: "refresh_cancel" });
+    dispatch({ type: "detail_cancel" });
+    dispatch({ type: "scope_save_start" });
+    const generation = state.generations.scope;
+    const attempted = state.scopeDraft;
+    const controller = new AbortController();
+    scopeController = controller;
+    const isCurrent = (): boolean => !quitting && !controller.signal.aborted && scopeController === controller && state.scopeSaving && state.generations.scope === generation;
+    try {
+      const result = await backend.applyJqlScope(attempted, controller.signal);
+      if (!isCurrent()) return;
+      dispatch({ type: "scope_save_succeeded", snapshot: result.snapshot, preferences: result.preferences, generation });
+      resumePolling();
+    } catch (error) {
+      if (!isCurrent()) return;
+      const message = error instanceof BackendError ? error.message.slice(0, 240) : "Jira scope could not be saved";
+      dispatch({ type: "scope_save_failed", message, generation });
+      resumePolling();
+    } finally {
+      if (scopeController === controller) scopeController = null;
     }
   }
 

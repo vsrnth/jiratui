@@ -44,9 +44,14 @@ export type RootState = {
   detectedTheme: "Light" | "Dark" | null;
   activeAppearance: AppearancePreferences;
   draftAppearance: AppearancePreferences;
-  appearanceRow: number;
+  /** Settings row: 0 scope, 1 theme, 2 no-color, 3 ASCII-only. */
+  settingsRow: number;
   appearanceDirty: boolean;
   jqlScope: string | null;
+  scopeDraft: string;
+  scopeEditing: boolean;
+  scopeSaving: boolean;
+  scopeError: string | null;
   teamMemberCount: number;
   siteLabel: string | null;
   identity: string | null;
@@ -73,7 +78,7 @@ export type RootState = {
   selectedUpdateIndex: number;
   selectedUpdateIssueId: IssueId | null;
   confirmMarkAllUpdates: boolean;
-  generations: { connect: number; refresh: number; detail: number; lookup: number };
+  generations: { connect: number; refresh: number; detail: number; lookup: number; scope: number };
   overlays: { help: boolean; eventLog: boolean };
   confirmForgetLogin: boolean;
   scroll: { list: number; detail: number; updates: number; team: number; eventLog: number };
@@ -90,13 +95,13 @@ export function initialState(size: TerminalSize = { width: 120, height: 40 }): R
     theme: "System", detectedTheme: null,
     activeAppearance: { theme: "System", noColor: false, asciiOnly: false },
     draftAppearance: { theme: "System", noColor: false, asciiOnly: false },
-    appearanceRow: 0, appearanceDirty: false, jqlScope: null, teamMemberCount: 0,
+    settingsRow: 0, appearanceDirty: false, jqlScope: null, scopeDraft: "", scopeEditing: false, scopeSaving: false, scopeError: null, teamMemberCount: 0,
     siteLabel: null, identity: null,
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
     issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
     detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
     updates: emptyUpdateLedger(), updatesBaselineEstablished: false, updateFilter: "unread", selectedUpdateIndex: 0, selectedUpdateIssueId: null, confirmMarkAllUpdates: false,
-    generations: { connect: 0, refresh: 0, detail: 0, lookup: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
+    generations: { connect: 0, refresh: 0, detail: 0, lookup: 0, scope: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
     scroll: { list: 0, detail: 0, updates: 0, team: 0, eventLog: 0 }, events: [], lastMessage: null,
   };
 }
@@ -106,12 +111,21 @@ export type Action =
   | { type: "theme_mode"; mode: "Light" | "Dark" }
   | { type: "set_theme"; mode: ThemeMode }
   | { type: "preferences_loaded"; preferences: SettingsPreferences }
-  | { type: "appearance_move"; delta: number }
+  | { type: "settings_move"; delta: number }
   | { type: "appearance_cycle" }
   | { type: "appearance_saved"; preferences: SettingsPreferences }
   | { type: "appearance_save_failed"; message?: string }
   | { type: "appearance_reload_failed"; message?: string }
   | { type: "appearance_restore" }
+  | { type: "scope_edit_start" }
+  | { type: "scope_edit_cancel" }
+  | { type: "scope_edit_insert"; value: string }
+  | { type: "scope_edit_backspace" }
+  | { type: "scope_restore" }
+  | { type: "scope_save_start" }
+  | { type: "scope_save_cancel" }
+  | { type: "scope_save_succeeded"; preferences: SettingsPreferences; snapshot: ScopeSnapshot; generation: number }
+  | { type: "scope_save_failed"; message: string; generation: number }
   | { type: "set_focus"; focus: Focus }
   | { type: "set_section"; section: Section }
   | { type: "onboarding_text"; value: string }
@@ -128,8 +142,10 @@ export type Action =
   | { type: "workspace_snapshot"; siteLabel: string; identity: string; issues: readonly IssueSummary[]; source: "cache" | "jira"; refreshedAt: string; generation: number; updates: UpdateLedger; updatesBaselineEstablished: boolean }
   | { type: "updates_persisted"; updates: UpdateLedger }
   | { type: "refresh_start" }
+  | { type: "refresh_cancel" }
   | { type: "refresh_error"; message: string; generation: number }
   | { type: "detail_start"; issueKey: string }
+  | { type: "detail_cancel" }
   | { type: "detail_result"; issue: IssueDetail; issueKey: string; generation: number }
   | { type: "detail_error"; message: string; generation: number }
   | { type: "set_search"; value: string }
@@ -151,6 +167,40 @@ export type Action =
   | { type: "select_update_issue" }
   | { type: "toggle_help" } | { type: "toggle_event_log" } | { type: "scroll"; delta: number }
   | { type: "message"; message: string; kind?: string };
+
+/** Renderer-neutral snapshot returned when applying a Jira scope. */
+export type ScopeSnapshot = Readonly<{
+  siteLabel: string;
+  identity: string;
+  issues: readonly IssueSummary[];
+  source: "cache" | "jira";
+  refreshedAt: string;
+  updates: UpdateLedger;
+  updatesBaselineEstablished: boolean;
+}>;
+
+export const MAX_JQL_SCOPE_BYTES = 2_000;
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function hasControlCharacter(value: string): boolean {
+  return /\p{Cc}/u.test(value);
+}
+
+function scopeValue(value: string): string {
+  return value.trim();
+}
+
+function validScopeEdit(current: string, value: string): boolean {
+  return value.length > 0 && !hasControlCharacter(value) && utf8Bytes(current + value) <= MAX_JQL_SCOPE_BYTES;
+}
+
+function withSettingsRow(state: RootState, row: number): RootState {
+  const next = clampIndex(row, 4);
+  return { ...state, settingsRow: next };
+}
 
 function withEvent(state: RootState, kind: string, message: string): RootState {
   return { ...state, lastMessage: message, events: [...state.events, event(kind, message)].slice(-64) };
@@ -218,25 +268,29 @@ export function reduce(state: RootState, action: Action): RootState {
     case "set_theme": return withAppearance(state, { ...state.draftAppearance, theme: action.mode });
     case "preferences_loaded": {
       const appearance = appearanceFrom(action.preferences);
+      const activeScope = scopeValue(action.preferences.jqlScope ?? "");
       return {
         ...state,
         theme: appearance.theme,
         activeAppearance: appearance,
         draftAppearance: appearance,
         appearanceDirty: false,
-        jqlScope: action.preferences.jqlScope?.trim() || null,
+        jqlScope: activeScope || null,
+        scopeDraft: state.scopeEditing || state.scopeSaving ? state.scopeDraft : activeScope,
+        scopeError: null,
         teamMemberCount: action.preferences.teamMembers?.length ?? 0,
       };
     }
-    case "appearance_move": return { ...state, appearanceRow: clampIndex(state.appearanceRow + action.delta, 3) };
+    case "settings_move": return state.scopeSaving ? state : withSettingsRow(state, state.settingsRow + action.delta);
     case "appearance_cycle": {
-      const row = state.appearanceRow;
-      if (row === 0) {
+      if (state.scopeSaving || state.scopeEditing || state.settingsRow === 0) return state;
+      const row = state.settingsRow;
+      if (row === 1) {
         const modes: ThemeMode[] = ["System", "Light", "Dark"];
         const index = Math.max(0, modes.indexOf(state.draftAppearance.theme));
         return withAppearance(state, { ...state.draftAppearance, theme: modes[(index + 1) % modes.length] ?? "System" });
       }
-      if (row === 1) return withAppearance(state, { ...state.draftAppearance, noColor: !state.draftAppearance.noColor });
+      if (row === 2) return withAppearance(state, { ...state.draftAppearance, noColor: !state.draftAppearance.noColor });
       return withAppearance(state, { ...state.draftAppearance, asciiOnly: !state.draftAppearance.asciiOnly });
     }
     case "appearance_saved": {
@@ -247,13 +301,68 @@ export function reduce(state: RootState, action: Action): RootState {
         activeAppearance: appearance,
         draftAppearance: appearance,
         appearanceDirty: false,
-        jqlScope: action.preferences.jqlScope?.trim() || null,
+        jqlScope: scopeValue(action.preferences.jqlScope ?? "") || null,
+        scopeDraft: state.scopeEditing || state.scopeSaving ? state.scopeDraft : scopeValue(action.preferences.jqlScope ?? ""),
+        scopeError: null,
         teamMemberCount: action.preferences.teamMembers?.length ?? 0,
       };
     }
     case "appearance_save_failed": return withEvent(state, "settings", action.message ?? "Appearance could not be saved; changes remain local");
     case "appearance_reload_failed": return withEvent(state, "settings", action.message ?? "Preferences could not be reloaded; changes remain local");
-    case "appearance_restore": return withAppearance(state, state.activeAppearance);
+    case "appearance_restore": return state.settingsRow === 0 ? state : withAppearance(state, state.activeAppearance);
+    case "scope_edit_start":
+      return state.scopeSaving ? state : { ...state, settingsRow: 0, scopeEditing: true, scopeError: null, scopeDraft: state.jqlScope ?? "" };
+    case "scope_edit_cancel": return state.scopeSaving ? state : { ...state, scopeEditing: false, scopeError: null };
+    case "scope_edit_insert": {
+      if (!state.scopeEditing || state.scopeSaving || !validScopeEdit(state.scopeDraft, action.value)) return state;
+      return { ...state, scopeDraft: state.scopeDraft + action.value, scopeError: null };
+    }
+    case "scope_edit_backspace": {
+      if (!state.scopeEditing || state.scopeSaving || state.scopeDraft.length === 0) return state;
+      const chars = Array.from(state.scopeDraft);
+      chars.pop();
+      return { ...state, scopeDraft: chars.join(""), scopeError: null };
+    }
+    case "scope_restore": return state.scopeSaving ? state : { ...state, scopeDraft: state.jqlScope ?? "", scopeError: null };
+    case "scope_save_start":
+      return state.scopeSaving ? state : { ...state, scopeEditing: true, scopeSaving: true, scopeError: null, generations: { ...state.generations, scope: state.generations.scope + 1 } };
+    case "scope_save_cancel":
+      return state.scopeSaving
+        ? withEvent({ ...state, scopeSaving: false, scopeEditing: true, generations: { ...state.generations, scope: state.generations.scope + 1 } }, "settings", "Jira scope save cancelled")
+        : state;
+    case "scope_save_succeeded": {
+      if (!state.scopeSaving || action.generation !== state.generations.scope) return state;
+      const appearance = appearanceFrom(action.preferences);
+      const activeScope = scopeValue(action.preferences.jqlScope ?? "");
+      const refreshed = reduce({
+        ...state,
+        theme: appearance.theme,
+        activeAppearance: appearance,
+        draftAppearance: appearance,
+        appearanceDirty: false,
+        jqlScope: activeScope || null,
+        scopeDraft: activeScope,
+        scopeEditing: false,
+        scopeSaving: false,
+        scopeError: null,
+        teamMemberCount: action.preferences.teamMembers?.length ?? 0,
+      }, {
+        type: "workspace_snapshot",
+        siteLabel: action.snapshot.siteLabel,
+        identity: action.snapshot.identity,
+        issues: action.snapshot.issues,
+        source: action.snapshot.source,
+        refreshedAt: action.snapshot.refreshedAt,
+        generation: state.generations.refresh,
+        updates: action.snapshot.updates,
+        updatesBaselineEstablished: action.snapshot.updatesBaselineEstablished,
+      });
+      return withEvent(refreshed, "settings", "Jira scope saved");
+    }
+    case "scope_save_failed":
+      return !state.scopeSaving || action.generation !== state.generations.scope
+        ? state
+        : withEvent({ ...state, scopeSaving: false, scopeEditing: true, scopeError: action.message.slice(0, 240) }, "settings", action.message.slice(0, 240));
     case "set_focus": return { ...state, focus: action.focus };
     case "set_section": return { ...state, section: action.section, focus: action.section === "issues" || action.section === "updates" ? "List" : action.section === "settings" ? "Settings" : "Nav" };
     case "onboarding_text": {
@@ -306,8 +415,10 @@ export function reduce(state: RootState, action: Action): RootState {
     }
     case "updates_persisted": return { ...state, updates: action.updates };
     case "refresh_start": return { ...state, refreshLoading: true, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
+    case "refresh_cancel": return { ...state, refreshLoading: false, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_error": return action.generation === state.generations.refresh ? withEvent({ ...state, refreshLoading: false }, "refresh", action.message) : state;
     case "detail_start": return { ...state, detailLoading: true, detailError: null, selectedIssueKey: action.issueKey, detail: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "detail_cancel": return { ...state, detailLoading: false, detail: null, detailError: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
     case "detail_result": return action.generation === state.generations.detail && action.issueKey === state.selectedIssueKey ? { ...state, detailLoading: false, detail: action.issue, detailError: null, scroll: { ...state.scroll, detail: 0 } } : state;
     case "detail_error": return action.generation === state.generations.detail ? withEvent({ ...state, detailLoading: false, detailError: action.message }, "detail", action.message) : state;
     case "set_search": {

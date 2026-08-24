@@ -66,7 +66,7 @@ describe("OpenTUI frames", () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {
       let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
-      state = reduce(state, { type: "appearance_move", delta: 2 });
+      state = reduce(state, { type: "settings_move", delta: 3 });
       state = reduce(state, { type: "appearance_cycle" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -86,7 +86,7 @@ describe("OpenTUI frames", () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {
       let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
-      state = reduce(state, { type: "appearance_move", delta: 1 });
+      state = reduce(state, { type: "settings_move", delta: 2 });
       state = reduce(state, { type: "appearance_cycle" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -229,7 +229,7 @@ describe("OpenTUI frames", () => {
       const newIssue = { ...changed, id: parseIssueId("10002"), key: parseIssueKey("OTHER-987654321"), summary: "New “user” issue → intact · text •", updated: "2026-08-24T02:00:00Z" };
       state = reduce(state, workspaceSnapshot([changed, newIssue], { source: "jira", refreshedAt: "later-2", updates: applyUpdateSnapshot(state.updates, [changed], [changed, newIssue]), updatesBaselineEstablished: true }));
       state = reduce(state, { type: "set_section", section: "updates" });
-      state = reduce(state, { type: "appearance_move", delta: 2 });
+      state = reduce(state, { type: "settings_move", delta: 3 });
       state = reduce(state, { type: "appearance_cycle" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -239,6 +239,39 @@ describe("OpenTUI frames", () => {
       expect(frame).toContain("Other Jira activity . exact field not available from sync");
       expect(frame).not.toContain("Other Jira activity · exact field not available from sync");
       expect(frame).not.toMatch(/[┌┐└┘─│▸●○▾…]/u);
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test("renders selected scope editor state, bounded bytes, errors, and Unicode JQL in ASCII mode", async () => {
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      let state = reduce(initialState({ width: 120, height: 40 }), { type: "preferences_loaded", preferences: { theme: "Dark", noColor: false, asciiOnly: true, jqlScope: "project = DEV" } });
+      state = {
+        ...state,
+        phase: "ready",
+        section: "settings",
+        focus: "Settings",
+        settingsRow: 0,
+        scopeEditing: true,
+        scopeSaving: true,
+        scopeDraft: "project = “DEV” → assignee = Ada",
+        scopeError: "ORDER BY is not allowed",
+      };
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Jira scope");
+      expect(frame).toContain("Attempted:");
+      expect(frame).toContain("Active: project = DEV");
+      expect(frame).toContain("UTF-8 bytes");
+      expect(frame).toContain("Saving");
+      expect(frame).toContain("...");
+      expect(frame).not.toContain(" …");
+      expect(frame).toContain("ORDER BY is not allowed");
+      expect(frame).toContain("project = “DEV” → assignee = Ada");
+      expect(frame).not.toContain("editing is not available yet");
     } finally {
       setup.renderer.destroy();
     }

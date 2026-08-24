@@ -1,6 +1,6 @@
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer, type Renderable } from "@opentui/core";
 import { maskedSecret } from "../secure-input";
-import { STATUS_CATEGORIES, visibleUpdateGroups, type RootState } from "../state";
+import { MAX_JQL_SCOPE_BYTES, STATUS_CATEGORIES, visibleUpdateGroups, type RootState } from "../state";
 import type { StatusCategory } from "../protocol";
 import { GENERIC_UPDATE_LABEL, type UpdateEvent } from "../updates/ledger";
 
@@ -260,24 +260,37 @@ function secondarySection(ctx: Context, state: RootState): BoxRenderable {
     padding: 2,
   });
   if (state.section === "settings") {
-    add(panel, appText(ctx, `Appearance${state.appearanceDirty ? " *" : ""}`, { fg: C.blue }));
-    const appearanceRows = [
+    add(panel, appText(ctx, `Settings${state.appearanceDirty ? " *" : ""}`, { fg: C.blue }));
+    const settingsRows = [
+      ["Jira scope", state.scopeEditing ? (state.scopeDraft || "(empty)") : (state.jqlScope || "Default")],
       ["Theme", state.draftAppearance.theme],
       ["No color", state.draftAppearance.noColor ? "On" : "Off"],
       ["ASCII-only", state.draftAppearance.asciiOnly ? "On" : "Off"],
     ] as const;
-    for (let index = 0; index < appearanceRows.length; index += 1) {
-      const row = appearanceRows[index];
+    for (let index = 0; index < settingsRows.length; index += 1) {
+      const row = settingsRows[index];
       if (!row) continue;
-      const selected = index === state.appearanceRow;
+      const selected = index === state.settingsRow;
       const marker = selected ? (activeAsciiOnly ? ">" : "▸") : " ";
-      add(panel, appText(ctx, `${marker} ${row[0]}: ${row[1]}${state.appearanceDirty ? " *" : ""}`, { fg: selected ? C.accent : C.fg, paddingTop: index === 0 ? 1 : 0 }));
+      const scopeProgress = state.scopeSaving && index === 0 ? (activeAsciiOnly ? " ..." : " …") : "";
+      const dirty = index > 0 && state.appearanceDirty ? " *" : "";
+      add(panel, index === 0
+        ? text(ctx, `${marker} ${row[0]}: ${row[1]}${scopeProgress}`, { fg: selected ? C.accent : C.fg, paddingTop: 1, width: "100%", wrapMode: "word" })
+        : appText(ctx, `${marker} ${row[0]}: ${row[1]}${dirty}`, { fg: selected ? C.accent : C.fg }));
     }
-    add(panel, appText(ctx, "j/k or arrows select · Space/Enter change · Ctrl-s save · Ctrl-r reload · x restore", { fg: C.dim, paddingTop: 1, width: "100%", wrapMode: "word" }));
-    const scope = state.jqlScope ? state.jqlScope.slice(0, 120) : "Default";
-    add(panel, text(ctx, `Active Jira scope: ${scope}`, { fg: C.fg, paddingTop: 1, width: "100%", wrapMode: "word" }));
+    if (state.scopeEditing) {
+      add(panel, text(ctx, "JQL editor", { fg: C.blue, paddingTop: 1 }));
+      add(panel, text(ctx, state.scopeDraft || "_", { fg: C.fg, width: "100%", wrapMode: "word" }));
+      add(panel, text(ctx, `Attempted: ${state.scopeDraft || "(blank)"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+      add(panel, text(ctx, `Active: ${state.jqlScope || "Default"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+      add(panel, appText(ctx, `${new TextEncoder().encode(state.scopeDraft).byteLength}/${MAX_JQL_SCOPE_BYTES} UTF-8 bytes${state.scopeSaving ? " · Saving…" : ""}`, { fg: state.scopeSaving ? C.warn : C.dim }));
+      if (state.scopeError) add(panel, text(ctx, `Error: ${state.scopeError}`, { fg: C.error, width: "100%", wrapMode: "word" }));
+      add(panel, appText(ctx, "Ctrl-s save · Esc close/cancel save · x restore active · Paste supported", { fg: C.dim, width: "100%", wrapMode: "word" }));
+    } else {
+      add(panel, appText(ctx, "j/k or arrows select · Space/Enter edit or change · Ctrl-s save · Ctrl-r reload · x restore", { fg: C.dim, paddingTop: 1, width: "100%", wrapMode: "word" }));
+    }
     add(panel, text(ctx, `Team members configured: ${state.teamMemberCount}`, { fg: C.fg, width: "100%" }));
-    add(panel, appText(ctx, "JQL scope and team membership are read-only summaries here; editing is not available yet.", { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(panel, appText(ctx, "Team membership is a summary; Jira scope is read-only in Jira and controls this workspace query.", { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(panel, text(ctx, "Saved login", { fg: C.blue }));
     add(panel, text(ctx, "Stored with Bun.secrets (macOS Keychain / Linux libsecret).", { fg: C.fg }));
     add(panel, text(ctx, "No plaintext fallback. The current session stays connected after removal.", { fg: C.dim }));
@@ -330,7 +343,7 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
     add(root, main);
   }
   add(root, footer(renderer, state));
-  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "Ctrl-s save appearance · Ctrl-r reload preferences · x restore active appearance", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus, true));
+  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "Settings: Jira scope row Space/Enter edit · Ctrl-s save · Esc close/cancel · x restore active", "Settings: Theme/No color/ASCII-only rows cycle with Space/Enter", "Ctrl-s save appearance · Ctrl-r reload preferences", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus, true));
   if (state.overlays.eventLog) add(root, overlay(renderer, "EVENT LOG", state.events.map((item) => `${item.at} ${item.kind}: ${item.message}`), state.focus));
   if (state.focus === "Picker" && state.pickerMode === "status") add(root, statusPicker(renderer, state));
   renderer.root.add(root);

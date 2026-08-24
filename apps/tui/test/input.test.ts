@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { handleKey, parseSequence } from "../src/input";
+import { decodeJqlPaste, handleKey, parseSequence, pasteJqlScope } from "../src/input";
+import { MAX_JQL_SCOPE_BYTES, type RootState } from "../src/state";
 import { initialState, reduce } from "../src/state";
 import type { IssueSummary } from "../src/domain";
 import { applyUpdateSnapshot, emptyUpdateLedger, type UpdateLedger } from "../src/updates/ledger";
@@ -221,9 +222,9 @@ describe("key handling", () => {
     expect(state.updates.readIssueIds).toEqual([issue.id]);
   });
   test("routes appearance controls without Jira refreshes", () => {
-    let state = { ...initialState(), phase: "ready" as const, section: "settings" as const, focus: "Settings" as const };
+    let state: RootState = { ...initialState(), phase: "ready", section: "settings", focus: "Settings" };
     let result = handleKey(state, { name: "down", sequence: "\u001b[B" });
-    expect(result.state.appearanceRow).toBe(1);
+    expect(result.state.settingsRow).toBe(1);
     result = handleKey(result.state, { name: "space", sequence: " " });
     expect(result.state.appearanceDirty).toBe(true);
     result = handleKey(result.state, { name: "s", sequence: "\u0013", ctrl: true });
@@ -233,5 +234,53 @@ describe("key handling", () => {
     expect(handleKey(result.state, { name: "r", sequence: "r" }).command).toBeNull();
     result = handleKey(result.state, { name: "x", sequence: "x" });
     expect(result.state.appearanceDirty).toBe(false);
+  });
+
+  test("routes four settings rows and opens the scope editor explicitly", () => {
+    let state: RootState = { ...initialState(), phase: "ready", section: "settings", focus: "Settings" };
+    state = handleKey(state, { name: "enter", sequence: "\r" }).state;
+    expect(state.scopeEditing).toBe(true);
+    expect(state.settingsRow).toBe(0);
+    state = handleKey(state, { name: "p", sequence: "p" }).state;
+    state = handleKey(state, { name: "backspace", sequence: "\u007f" }).state;
+    expect(state.scopeDraft).toBe("");
+    state = handleKey(state, { name: "x", sequence: "x" }).state;
+    expect(state.scopeDraft).toBe("");
+    state = handleKey(state, { name: "escape", sequence: "\u001b" }).state;
+    expect(state.scopeEditing).toBe(false);
+
+    state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
+    expect(state.settingsRow).toBe(1);
+    state = handleKey(state, { name: "space", sequence: " " }).state;
+    expect(state.draftAppearance.theme).toBe("Light");
+    state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
+    state = handleKey(state, { name: "space", sequence: " " }).state;
+    expect(state.draftAppearance.noColor).toBe(true);
+    state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
+    state = handleKey(state, { name: "space", sequence: " " }).state;
+    expect(state.draftAppearance.asciiOnly).toBe(true);
+  });
+
+  test("rejects invalid/control/oversized JQL pastes atomically", () => {
+    const encoded = new TextEncoder();
+    expect(decodeJqlPaste(encoded.encode("project = DEV\n"))).toBeNull();
+    expect(decodeJqlPaste(Uint8Array.from([0xc3, 0x28]))).toBeNull();
+    expect(pasteJqlScope("x", encoded.encode("é"))).toBe("é");
+    expect(pasteJqlScope("a".repeat(MAX_JQL_SCOPE_BYTES - 1), encoded.encode("é"))).toBeNull();
+    expect(pasteJqlScope("a".repeat(MAX_JQL_SCOPE_BYTES), encoded.encode("z"))).toBeNull();
+  });
+
+  test("blocks duplicate scope saves/navigation and cancels with a generation bump", () => {
+    let state: RootState = { ...initialState(), phase: "ready", section: "settings", focus: "Settings", scopeEditing: true };
+    const save = handleKey(state, { name: "s", sequence: "\u0013", ctrl: true });
+    expect(save.command).toBe("save_jql_scope");
+    state = reduce(save.state, { type: "scope_save_start" });
+    const generation = state.generations.scope;
+    expect(handleKey(state, { name: "s", sequence: "\u0013", ctrl: true })).toEqual({ state, command: null });
+    expect(handleKey(state, { name: "down", sequence: "\u001b[B" })).toEqual({ state, command: null });
+    const cancelled = handleKey(state, { name: "escape", sequence: "\u001b" });
+    expect(cancelled.command).toBe("cancel_scope_save");
+    expect(cancelled.state.scopeSaving).toBe(false);
+    expect(cancelled.state.generations.scope).toBe(generation + 1);
   });
 });

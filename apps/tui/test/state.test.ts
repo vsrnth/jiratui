@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { initialState, reduce, visibleUpdateGroups } from "../src/state";
+import { initialState, MAX_JQL_SCOPE_BYTES, reduce, visibleUpdateGroups } from "../src/state";
 import { parseIssueId, parseIssueKey } from "../src/domain";
 import { applyUpdateSnapshot, emptyUpdateLedger } from "../src/updates/ledger";
 
@@ -194,7 +194,7 @@ describe("root reducer", () => {
     let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "Light", noColor: true, asciiOnly: false, jqlScope: "project = DEV", teamMembers: ["ada", "grace"] } });
     expect(state.activeAppearance).toEqual({ theme: "Light", noColor: true, asciiOnly: false });
     expect(state.teamMemberCount).toBe(2);
-    state = reduce(state, { type: "appearance_move", delta: 1 });
+    state = reduce(state, { type: "settings_move", delta: 2 });
     state = reduce(state, { type: "appearance_cycle" });
     expect(state.draftAppearance.noColor).toBe(false);
     expect(state.appearanceDirty).toBe(true);
@@ -208,11 +208,90 @@ describe("root reducer", () => {
   });
   test("clears appearance dirty state when a preview cycles back to active", () => {
     let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "System", noColor: false, asciiOnly: false } });
+    state = reduce(state, { type: "settings_move", delta: 1 });
     state = reduce(state, { type: "appearance_cycle" });
     expect(state.appearanceDirty).toBe(true);
     state = reduce(state, { type: "appearance_cycle" });
     state = reduce(state, { type: "appearance_cycle" });
     expect(state.draftAppearance).toEqual(state.activeAppearance);
     expect(state.appearanceDirty).toBe(false);
+  });
+
+  test("edits the four-row Jira scope editor with Unicode-safe bounds and restore", () => {
+    let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "System", noColor: false, asciiOnly: false, jqlScope: "project = DEV" } });
+    state = { ...state, phase: "ready", section: "settings", focus: "Settings" };
+    expect(state.settingsRow).toBe(0);
+    state = reduce(state, { type: "scope_edit_start" });
+    expect(state.scopeEditing).toBe(true);
+    expect(state.scopeDraft).toBe("project = DEV");
+    state = reduce(state, { type: "scope_edit_insert", value: "é" });
+    expect(state.scopeDraft.endsWith("é")).toBe(true);
+    state = reduce(state, { type: "scope_edit_backspace" });
+    expect(state.scopeDraft).toBe("project = DEV");
+    state = reduce(state, { type: "scope_edit_insert", value: "changed" });
+    state = reduce(state, { type: "scope_restore" });
+    expect(state.scopeDraft).toBe("project = DEV");
+
+    state = reduce(initialState(), { type: "scope_edit_start" });
+    state = reduce(state, { type: "scope_edit_insert", value: "a".repeat(MAX_JQL_SCOPE_BYTES - 2) });
+    state = reduce(state, { type: "scope_edit_insert", value: "é" });
+    expect(new TextEncoder().encode(state.scopeDraft).byteLength).toBe(MAX_JQL_SCOPE_BYTES);
+    const bounded = state.scopeDraft;
+    state = reduce(state, { type: "scope_edit_insert", value: "é" });
+    expect(state.scopeDraft).toBe(bounded);
+    expect(new TextEncoder().encode(state.scopeDraft).byteLength).toBeLessThanOrEqual(MAX_JQL_SCOPE_BYTES);
+    expect(reduce(state, { type: "scope_edit_insert", value: "\n" })).toBe(state);
+  });
+
+  test("scope save generations block duplicates, cancel stale results, and retain failed attempts", () => {
+    let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "System", noColor: false, asciiOnly: false, jqlScope: "project = DEV" } });
+    state = reduce(state, { type: "scope_edit_start" });
+    state = reduce(state, { type: "scope_edit_insert", value: " AND status = Open" });
+    const attempted = state.scopeDraft;
+    state = reduce(state, { type: "scope_save_start" });
+    const generation = state.generations.scope;
+    expect(reduce(state, { type: "scope_save_start" })).toBe(state);
+    expect(reduce(state, { type: "scope_save_failed", generation: generation - 1, message: "stale" })).toBe(state);
+    state = reduce(state, { type: "scope_save_cancel" });
+    expect(state.scopeSaving).toBe(false);
+    expect(state.scopeEditing).toBe(true);
+    expect(state.scopeDraft).toBe(attempted);
+    expect(reduce(state, { type: "scope_save_failed", generation, message: "stale" })).toBe(state);
+
+    state = reduce(state, { type: "scope_save_start" });
+    const failedGeneration = state.generations.scope;
+    state = reduce(state, { type: "scope_save_failed", generation: failedGeneration, message: "ORDER BY is not allowed" });
+    expect(state.scopeSaving).toBe(false);
+    expect(state.scopeDraft).toBe(attempted);
+    expect(state.jqlScope).toBe("project = DEV");
+    expect(state.scopeError).toBe("ORDER BY is not allowed");
+  });
+
+  test("adopts canonical preferences and workspace snapshot only for current scope success", () => {
+    const original = issues[0]!;
+    const replacement = { ...original, summary: "Scoped issue" };
+    let state = reduce(initialState(), snapshot([original]));
+    state = reduce(state, { type: "preferences_loaded", preferences: { theme: "Light", noColor: false, asciiOnly: true, jqlScope: "project = DEV" } });
+    state = reduce(state, { type: "scope_edit_start" });
+    state = reduce(state, { type: "scope_edit_insert", value: " AND assignee = ada" });
+    state = reduce(state, { type: "scope_save_start" });
+    const generation = state.generations.scope;
+    const stale = reduce(state, {
+      type: "scope_save_succeeded", generation: generation - 1,
+      preferences: { theme: "Dark", noColor: false, asciiOnly: false, jqlScope: "stale" },
+      snapshot: { siteLabel: "stale", identity: "stale", issues: [], source: "jira", refreshedAt: "stale", updates: emptyUpdateLedger(), updatesBaselineEstablished: true },
+    });
+    expect(stale).toBe(state);
+    state = reduce(state, {
+      type: "scope_save_succeeded", generation,
+      preferences: { theme: "Dark", noColor: true, asciiOnly: false, jqlScope: "project = OPS", teamMembers: ["ada"] },
+      snapshot: { siteLabel: "site", identity: "user", issues: [replacement], source: "jira", refreshedAt: "later", updates: emptyUpdateLedger(), updatesBaselineEstablished: true },
+    });
+    expect(state.scopeSaving).toBe(false);
+    expect(state.scopeEditing).toBe(false);
+    expect(state.jqlScope).toBe("project = OPS");
+    expect(state.draftAppearance).toEqual({ theme: "Dark", noColor: true, asciiOnly: false });
+    expect(state.issues).toEqual([replacement]);
+    expect(state.lastSource).toBe("jira");
   });
 });

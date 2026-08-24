@@ -1,8 +1,8 @@
 import { backspaceSecret, deleteSecret, editSecret, moveSecret } from "./secure-input";
-import { reduce, type Action, type Focus, type RootState } from "./state";
+import { MAX_JQL_SCOPE_BYTES, reduce, type Action, type Focus, type RootState } from "./state";
 
 export type KeyLike = { name?: string; sequence?: string; ctrl?: boolean; shift?: boolean; meta?: boolean };
-export type InputCommand = "quit" | "connect" | "cancel_connect" | "refresh" | "reload_preferences" | "save_appearance" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
+export type InputCommand = "quit" | "connect" | "cancel_connect" | "cancel_scope_save" | "refresh" | "reload_preferences" | "save_appearance" | "save_jql_scope" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
 export type InputResult = { state: RootState; command: InputCommand };
 const focusOrder: Focus[] = ["Nav", "Search", "List", "Detail", "Composer", "Picker", "Settings"];
 
@@ -23,6 +23,25 @@ function moveFocus(state: RootState, delta: number): RootState {
 function updateMutation(state: RootState, action: Action): InputResult {
   const next = reduce(state, action);
   return { state: next, command: next.updates !== state.updates ? "persist_updates" : null };
+}
+
+const CONTROL_CHARACTER = /\p{Cc}/u;
+
+/** Decode a paste as strict UTF-8 and reject controls before it reaches state. */
+export function decodeJqlPaste(bytes: Uint8Array): string | null {
+  try {
+    const value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return value.length > 0 && !CONTROL_CHARACTER.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Return a whole paste only when it fits; callers must reject the paste atomically otherwise. */
+export function pasteJqlScope(current: string, bytes: Uint8Array): string | null {
+  const value = decodeJqlPaste(bytes);
+  if (value === null) return null;
+  return new TextEncoder().encode(current + value).byteLength <= MAX_JQL_SCOPE_BYTES ? value : null;
 }
 
 export function handleKey(state: RootState, key: KeyLike): InputResult {
@@ -75,6 +94,24 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     }
     return { state, command: null };
   }
+  // A scope save owns the settings interaction until it resolves or is
+  // explicitly cancelled. This prevents navigation and duplicate submissions
+  // from racing the backend operation.
+  if (state.scopeSaving) {
+    if (name === "escape") return { state: reduce(state, { type: "scope_save_cancel" }), command: "cancel_scope_save" };
+    return { state, command: null };
+  }
+  if (state.section === "settings" && state.scopeEditing) {
+    if (name === "escape") return { state: reduce(state, { type: "scope_edit_cancel" }), command: null };
+    if (key.ctrl && name === "s") return { state, command: "save_jql_scope" };
+    if (name === "x") return { state: reduce(state, { type: "scope_restore" }), command: null };
+    if (name === "backspace") return { state: reduce(state, { type: "scope_edit_backspace" }), command: null };
+    const scopeText = key.sequence ?? "";
+    if (!key.ctrl && !key.meta && Array.from(scopeText).length === 1 && !CONTROL_CHARACTER.test(scopeText)) {
+      return { state: reduce(state, { type: "scope_edit_insert", value: scopeText }), command: null };
+    }
+    return { state, command: null };
+  }
   if (state.focus === "Picker" && state.pickerMode === "status") {
     if (name === "escape") return { state: reduce(state, { type: "cancel_status_filter" }), command: null };
     if (name === "enter") return { state: reduce(state, { type: "apply_status_filter" }), command: null };
@@ -106,12 +143,12 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
   const sections = { "1": "issues", "2": "updates", "3": "team", "4": "settings" } as const;
   if (name in sections) return { state: reduce(state, { type: "set_section", section: sections[name as keyof typeof sections] }), command: null };
   if (state.section === "settings") {
-    if (key.ctrl && name === "s") return { state, command: "save_appearance" };
+    if (key.ctrl && name === "s") return { state, command: state.settingsRow === 0 ? "save_jql_scope" : "save_appearance" };
     if (key.ctrl && name === "r") return { state, command: "reload_preferences" };
-    if (name === "x") return { state: reduce(state, { type: "appearance_restore" }), command: null };
-    if (name === "up" || name === "k") return { state: reduce(state, { type: "appearance_move", delta: -1 }), command: null };
-    if (name === "down" || name === "j") return { state: reduce(state, { type: "appearance_move", delta: 1 }), command: null };
-    if (name === "space" || key.sequence === " " || name === "enter") return { state: reduce(state, { type: "appearance_cycle" }), command: null };
+    if (name === "x") return { state: reduce(state, state.settingsRow === 0 ? { type: "scope_restore" } : { type: "appearance_restore" }), command: null };
+    if (name === "up" || name === "k") return { state: reduce(state, { type: "settings_move", delta: -1 }), command: null };
+    if (name === "down" || name === "j") return { state: reduce(state, { type: "settings_move", delta: 1 }), command: null };
+    if (name === "space" || key.sequence === " " || name === "enter") return { state: reduce(state, state.settingsRow === 0 ? { type: "scope_edit_start" } : { type: "appearance_cycle" }), command: null };
   }
   if (state.section === "updates") {
     const uppercaseM = key.sequence === "M" || key.name === "M" || (name === "m" && key.shift === true);
