@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { ensureDataDirectory, IssueCache, MAX_CACHED_ISSUES, StorageError, validateCacheIdentity } from "../src/storage/cache";
+import { ensureDataDirectory, IssueCache, MAX_CACHED_ISSUES, scopePartitionSiteId, StorageError, validateCacheIdentity } from "../src/storage/cache";
 import { SystemCredentialStore, type SecretProvider } from "../src/storage/credentials";
 import type { IssueSummary } from "../src/domain";
 import { applyUpdateSnapshot, emptyUpdateLedger, markGroupsRead, setGroupExpanded, type UpdateEvent } from "../src/updates/ledger";
@@ -177,6 +177,38 @@ describe("IssueCache", () => {
     temporary.push(root, real);
 
     expect(() => ensureDataDirectory({ XDG_DATA_HOME: root })).toThrow(StorageError);
+  });
+});
+
+describe("scopePartitionSiteId", () => {
+  test("preserves the validated site identity for an omitted or blank scope", () => {
+    expect(scopePartitionSiteId("  site-a  ")).toBe("site-a");
+    expect(scopePartitionSiteId("  site-a  ", undefined)).toBe("site-a");
+    expect(scopePartitionSiteId("  site-a  ", "   ")).toBe("site-a");
+  });
+
+  test("normalizes scope whitespace and separates sites and scopes", () => {
+    const first = scopePartitionSiteId("site-a", "  project = DEV  ");
+    expect(first).toBe(scopePartitionSiteId("site-a", "project = DEV"));
+    expect(first).not.toBe(scopePartitionSiteId("site-a", "project = OPS"));
+    expect(first).not.toBe(scopePartitionSiteId("site-b", "project = DEV"));
+  });
+
+  test("returns a bounded opaque identity without raw site or JQL text", () => {
+    const site = "tenant.example.test";
+    const scope = "project = DEV AND summary ~ \"needle/with spaces\"";
+    const partition = scopePartitionSiteId(site, scope);
+    expect(partition).toMatch(/^scope-v1:[0-9a-f]{64}$/);
+    expect(partition.length).toBeLessThanOrEqual(320);
+    expect(partition).not.toContain(site);
+    expect(partition).not.toContain(scope);
+    expect([...partition].some((char) => /\p{Cc}/u.test(char))).toBe(false);
+    expect(partition).not.toMatch(/[\\/]/u);
+  });
+
+  test("rejects an unsafe base site identity", () => {
+    expect(() => scopePartitionSiteId("site-\u0000-a", "project = DEV")).toThrow(StorageError);
+    expect(() => scopePartitionSiteId("x".repeat(321), "project = DEV")).toThrow(StorageError);
   });
 });
 

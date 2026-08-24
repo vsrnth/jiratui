@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import type { IssueSummary } from "../domain";
@@ -21,10 +22,33 @@ export class StorageError extends Error {
   constructor(code: StorageError["code"], message: string) { super(message); this.name = "StorageError"; this.code = code; }
 }
 
+const validCacheIdentityValue = (value: string): boolean => value.trim().length > 0 && value.length <= 320 && ![...value].some((char) => /\p{Cc}/u.test(char));
+
 export function validateCacheIdentity(siteId: string, accountId: string): CacheIdentity {
-  const valid = (value: string) => value.trim().length > 0 && value.length <= 320 && ![...value].some((char) => /\p{Cc}/u.test(char));
-  if (!valid(siteId) || !valid(accountId)) throw new StorageError("invalid_identity", "Invalid cache identity");
+  if (!validCacheIdentityValue(siteId) || !validCacheIdentityValue(accountId)) throw new StorageError("invalid_identity", "Invalid cache identity");
   return { siteId: siteId.trim(), accountId: accountId.trim() };
+}
+
+/**
+ * Derive the site identity used for a scoped cache partition.
+ *
+ * An omitted or blank scope intentionally keeps the historical site identity,
+ * so existing unscoped caches remain readable. Scoped identities are opaque
+ * and stable: neither the site nor the JQL expression is persisted in them.
+ */
+export function scopePartitionSiteId(siteId: string, scope?: string): string {
+  if (!validCacheIdentityValue(siteId)) throw new StorageError("invalid_identity", "Invalid cache identity");
+  const normalizedSiteId = siteId.trim();
+  const normalizedScope = scope?.trim() ?? "";
+  if (normalizedScope.length === 0) return normalizedSiteId;
+
+  const digest = createHash("sha256")
+    .update("jira-desk-scope-v1\0", "utf8")
+    .update(normalizedSiteId, "utf8")
+    .update("\0", "utf8")
+    .update(normalizedScope, "utf8")
+    .digest("hex");
+  return `scope-v1:${digest}`;
 }
 
 /** Resolve the app directory without ever accepting a relative root. */
