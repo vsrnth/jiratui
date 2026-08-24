@@ -43,6 +43,13 @@ notifications. `Enter` selects an update's issue and opens its existing read-onl
 Open Settings with `4`; press `f`, then `y`, to remove the saved keychain login without ending the
 current Jira session.
 
+Settings appearance controls are local previews until explicitly saved: use `j`/`k` (or arrows) to
+select `Theme`, `No color`, or `ASCII-only`, then press `Space` or `Enter` to preview a change.
+Press `Ctrl-s` to atomically save the draft, `Ctrl-r` to reload saved preferences, or `x` to restore
+the active value. `System` follows the detected terminal theme and falls back to Dark when detection
+is unavailable. The displayed JQL scope and team member count are summaries only; editing them is
+not currently available.
+
 Credentials never enter argv, renderer snapshots, diagnostics, or cache files. The custom token
 editor is masked and clears its buffer immediately after a connection attempt. On macOS and Linux,
 remember login uses Bun's native secrets API; if it is unavailable the session still connects
