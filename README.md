@@ -35,8 +35,10 @@ lookup, `Enter` for detail, `r` to refresh, `?` for help, and `q` to quit.
 
 Press `2` for Updates. Its `u` (Unread/All), `m` (toggle read), `M` (mark displayed read),
 `Space`/`o` (expand), and `r` (local status message) controls do not contact Jira. Updates are
-grouped from accepted snapshots, start with a quiet baseline, and currently live in memory for the
-active session. `Enter` selects an update's issue and opens its existing read-only detail view.
+grouped from accepted snapshots with a quiet baseline; the bounded ledger and its read/expanded
+state persist account- and site-scoped in the owner-only SQLite workspace cache across sessions.
+Jira operations remain read-only, and local mark/read/expand actions never acknowledge Jira
+notifications. `Enter` selects an update's issue and opens its existing read-only detail view.
 
 Open Settings with `4`; press `f`, then `y`, to remove the saved keychain login without ending the
 current Jira session.
