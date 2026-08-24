@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { ensureDataDirectory, IssueCache, MAX_CACHED_ISSUES, StorageError, validateCacheIdentity } from "../src/storage/cache";
 import { SystemCredentialStore, type SecretProvider } from "../src/storage/credentials";
 import type { IssueSummary } from "../src/domain";
+import { applyUpdateSnapshot, emptyUpdateLedger, markGroupsRead, setGroupExpanded, type UpdateEvent } from "../src/updates/ledger";
 
 const temporary: string[] = [];
 afterEach(() => { for (const path of temporary.splice(0)) if (existsSync(path)) rmSync(path, { recursive: true, force: true }); });
@@ -26,6 +28,125 @@ describe("IssueCache", () => {
     const cache = cacheAt();
     const values = Array.from({ length: MAX_CACHED_ISSUES + 1 }, (_, index) => issue(index + 1));
     expect(() => cache.replace(validateCacheIdentity("site", "account"), values)).toThrow(StorageError);
+    cache.close();
+  });
+
+  test("round-trips the workspace ledger, local state, and baseline by partition", () => {
+    const cache = cacheAt();
+    const first = validateCacheIdentity("site-roundtrip", "account-a");
+    const second = validateCacheIdentity("site-roundtrip", "account-b");
+    const previous = issue(1);
+    const current = { ...previous, summary: "Changed", updated: "2026-02-01" };
+    let ledger = applyUpdateSnapshot(emptyUpdateLedger(), [previous], [current]);
+    ledger = markGroupsRead(ledger, [current.id], true, [current.id]);
+    ledger = setGroupExpanded(ledger, current.id, true);
+    const committed = cache.commitWorkspace(first, [current], ledger, true);
+    expect(committed).toEqual({ issues: [current], updates: ledger, baselineEstablished: true });
+    expect(committed.issues).not.toBe(current);
+    expect(committed.updates).not.toBe(ledger);
+    cache.commitWorkspace(second, [issue(2)], emptyUpdateLedger(), false);
+    expect(cache.loadWorkspace(first)).toMatchObject({ issues: [current], baselineEstablished: true });
+    expect(cache.loadWorkspace(first).updates).toEqual(ledger);
+    expect(cache.loadWorkspace(second).updates).toEqual(emptyUpdateLedger());
+    cache.close();
+  });
+
+  test("saveUpdateLedger prunes membership and enforces the 500-event bound", () => {
+    const cache = cacheAt();
+    const identity = validateCacheIdentity("site-ledger", "account-a");
+    const active = issue(1);
+    const inactive = issue(2);
+    const events: UpdateEvent[] = Array.from({ length: 501 }, (_, index) => ({
+      id: `event-${index}`,
+      issueId: active.id,
+      issueKey: active.key,
+      issueSummary: active.summary,
+      occurredAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`,
+      field: "other",
+      label: "Other Jira activity · exact field not available from sync",
+      previousValue: null,
+      currentValue: null,
+    }));
+    const saved = cache.saveUpdateLedger(identity, {
+      events: [...events, { ...events[0]!, issueId: inactive.id, issueKey: inactive.key }],
+      readIssueIds: [active.id, inactive.id],
+      expandedIssueIds: [active.id, inactive.id],
+    }, [active]);
+    expect(saved.events).toHaveLength(500);
+    expect(saved.events.every((event) => event.issueId === active.id)).toBe(true);
+    expect(saved.readIssueIds).toEqual([active.id]);
+    expect(saved.expandedIssueIds).toEqual([active.id]);
+    cache.close();
+  });
+
+  test("creates missing v4 ledger tables for an existing v4 database", () => {
+    const dir = `/tmp/jira-desk-storage-legacy-${crypto.randomUUID()}`;
+    mkdirSync(dir, { recursive: true }); temporary.push(dir);
+    const path = join(dir, "jira-desk.sqlite3");
+    const legacy = new Database(path, { create: true });
+    legacy.run("PRAGMA user_version = 4");
+    legacy.close();
+    const cache = new IssueCache(path);
+    cache.commitWorkspace(validateCacheIdentity("site", "account"), [issue(1)], emptyUpdateLedger(), false);
+    expect(cache.loadWorkspace(validateCacheIdentity("site", "account")).issues).toHaveLength(1);
+    cache.close();
+  });
+
+  test("keeps the prior workspace when a malformed commit is rejected before mutation", () => {
+    const cache = cacheAt();
+    const identity = validateCacheIdentity("site-atomic", "account-a");
+    const original = issue(1);
+    const ledger = applyUpdateSnapshot(emptyUpdateLedger(), [original], [{ ...original, summary: "Changed", updated: "2026-02-01" }]);
+    cache.commitWorkspace(identity, [original], ledger, true);
+    const malformed = { ...original, key: "invalid" as IssueSummary["key"] };
+    expect(() => cache.commitWorkspace(identity, [malformed], emptyUpdateLedger(), false)).toThrow(StorageError);
+    const restored = cache.loadWorkspace(identity);
+    expect(restored.issues).toEqual([original]);
+    expect(restored.updates).toEqual(ledger);
+    expect(restored.baselineEstablished).toBe(true);
+    cache.close();
+  });
+
+  test("rolls back all workspace tables when an insert fails inside the transaction", () => {
+    const dir = `/tmp/jira-desk-storage-transaction-${crypto.randomUUID()}`;
+    mkdirSync(dir, { recursive: true }); temporary.push(dir);
+    const path = join(dir, "jira-desk.sqlite3");
+    const cache = new IssueCache(path);
+    const identity = validateCacheIdentity("site-transaction", "account-a");
+    const original = issue(1);
+    const originalLedger = applyUpdateSnapshot(emptyUpdateLedger(), [original], [{ ...original, summary: "Changed", updated: "2026-02-01" }]);
+    cache.commitWorkspace(identity, [original], originalLedger, true);
+
+    const triggerDb = new Database(path, { create: true });
+    triggerDb.run(`CREATE TRIGGER fail_update_insert BEFORE INSERT ON update_events
+      WHEN NEW.event_id = 'boom'
+      BEGIN SELECT RAISE(ABORT, 'deliberate test failure'); END`);
+    triggerDb.close();
+    const failingIssue = { ...original, id: "2" as IssueSummary["id"], key: "DEV-2" as IssueSummary["key"] };
+    const failingLedger = {
+      events: [{
+        id: "boom",
+        issueId: failingIssue.id,
+        issueKey: failingIssue.key,
+        issueSummary: failingIssue.summary,
+        occurredAt: "2026-03-01T00:00:00.000Z",
+        field: "other" as const,
+        label: "Other Jira activity · exact field not available from sync",
+        previousValue: null,
+        currentValue: null,
+      }],
+      readIssueIds: [failingIssue.id],
+      expandedIssueIds: [failingIssue.id],
+    };
+    expect(() => cache.commitWorkspace(identity, [failingIssue], failingLedger, false)).toThrow();
+    const dropTriggerDb = new Database(path, { create: true });
+    dropTriggerDb.run("DROP TRIGGER fail_update_insert");
+    dropTriggerDb.close();
+
+    const restored = cache.loadWorkspace(identity);
+    expect(restored.issues).toEqual([original]);
+    expect(restored.updates).toEqual(originalLedger);
+    expect(restored.baselineEstablished).toBe(true);
     cache.close();
   });
 
