@@ -2,7 +2,7 @@ import { backspaceSecret, deleteSecret, editSecret, moveSecret } from "./secure-
 import { reduce, type Action, type Focus, type RootState } from "./state";
 
 export type KeyLike = { name?: string; sequence?: string; ctrl?: boolean; shift?: boolean; meta?: boolean };
-export type InputCommand = "quit" | "connect" | "cancel_connect" | "refresh" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
+export type InputCommand = "quit" | "connect" | "cancel_connect" | "refresh" | "reload_preferences" | "save_appearance" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
 export type InputResult = { state: RootState; command: InputCommand };
 const focusOrder: Focus[] = ["Nav", "Search", "List", "Detail", "Composer", "Picker", "Settings"];
 
@@ -105,6 +105,14 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
   }
   const sections = { "1": "issues", "2": "updates", "3": "team", "4": "settings" } as const;
   if (name in sections) return { state: reduce(state, { type: "set_section", section: sections[name as keyof typeof sections] }), command: null };
+  if (state.section === "settings") {
+    if (key.ctrl && name === "s") return { state, command: "save_appearance" };
+    if (key.ctrl && name === "r") return { state, command: "reload_preferences" };
+    if (name === "x") return { state: reduce(state, { type: "appearance_restore" }), command: null };
+    if (name === "up" || name === "k") return { state: reduce(state, { type: "appearance_move", delta: -1 }), command: null };
+    if (name === "down" || name === "j") return { state: reduce(state, { type: "appearance_move", delta: 1 }), command: null };
+    if (name === "space" || key.sequence === " " || name === "enter") return { state: reduce(state, { type: "appearance_cycle" }), command: null };
+  }
   if (state.section === "updates") {
     const uppercaseM = key.sequence === "M" || key.name === "M" || (name === "m" && key.shift === true);
     if (name === "up" || name === "k") return { state: reduce(state, { type: "move_update_selection", delta: -1 }), command: null };
@@ -147,6 +155,8 @@ export function parseSequence(sequence: string): KeyLike {
   const name = table[sequence];
   if (name) return { name, sequence };
   if (sequence === "\u0007") return { name: "g", sequence, ctrl: true };
+  if (sequence === "\u0012") return { name: "r", sequence, ctrl: true };
+  if (sequence === "\u0013") return { name: "s", sequence, ctrl: true };
   if (sequence.length === 2 && sequence[0] === "\u0003") return { name: "c", sequence, ctrl: true };
   if (sequence.length === 2 && sequence[0] === "\u000c") return { name: "l", sequence, ctrl: true };
   const result: KeyLike = { sequence };

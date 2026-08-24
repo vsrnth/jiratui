@@ -68,6 +68,8 @@ export async function run(): Promise<void> {
       if (result.command === "retry_resize") { dispatch({ type: "resize", size: { width: renderer?.width ?? 1, height: renderer?.height ?? 1 } }); return true; }
       if (result.command === "connect") { void connect(); return true; }
       if (result.command === "refresh") { void refresh(); return true; }
+      if (result.command === "save_appearance") { saveAppearancePreferences(); return true; }
+      if (result.command === "reload_preferences") { reloadPreferences(); return true; }
       if (result.command === "detail") { void loadDetail(); return true; }
       if (result.command === "focus_search") { return true; }
       if (result.command === "lookup") { dispatch({ type: "set_focus", focus: "Picker" }); dispatch({ type: "set_lookup", value: "" }); dispatch({ type: "message", message: "Enter a complete issue key, then press Enter", kind: "lookup" }); return true; }
@@ -93,6 +95,13 @@ export async function run(): Promise<void> {
     onThemeMode = (mode: unknown) => { if (mode === "light" || mode === "dark" || mode === "Light" || mode === "Dark") dispatch({ type: "theme_mode", mode: String(mode).toLowerCase() === "light" || mode === "Light" ? "Light" : "Dark" }); };
     renderer.on("theme_mode", onThemeMode);
     renderer.on("resize", onResize);
+    // Preferences are loaded before the first meaningful frame. Only a
+    // bounded, local warning is exposed if the backend cannot read them.
+    try {
+      state = reduce(state, { type: "preferences_loaded", preferences: backend.loadPreferences() });
+    } catch {
+      state = reduce(state, { type: "message", message: "Preferences could not be loaded; using defaults", kind: "warning" });
+    }
     draw();
     const bootstrap = await backend.bootstrap();
     if (bootstrap.state === "authenticated") {
@@ -231,6 +240,26 @@ export async function run(): Promise<void> {
     } catch (error) {
       const detail = error instanceof BackendError ? error.message.slice(0, 240) : "";
       dispatch({ type: "message", message: detail ? `Updates could not be saved: ${detail}` : "Updates could not be saved; changes remain local", kind: "warning" });
+    }
+  }
+
+  function saveAppearancePreferences(): void {
+    try {
+      const preferences = backend.saveAppearancePreferences(state.draftAppearance);
+      dispatch({ type: "appearance_saved", preferences });
+      dispatch({ type: "message", message: "Appearance preferences saved", kind: "success" });
+    } catch {
+      // Keep the draft intact so the user can repair and retry it.
+      dispatch({ type: "appearance_save_failed", message: "Appearance could not be saved; changes remain local" });
+    }
+  }
+
+  function reloadPreferences(): void {
+    try {
+      dispatch({ type: "preferences_loaded", preferences: backend.loadPreferences() });
+      dispatch({ type: "message", message: "Preferences reloaded", kind: "success" });
+    } catch {
+      dispatch({ type: "appearance_reload_failed", message: "Preferences could not be reloaded; changes remain local" });
     }
   }
 }

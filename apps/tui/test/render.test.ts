@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { parseIssueId, parseIssueKey, type IssueDetail, type IssueSummary } from "../src/domain";
-import { renderApp } from "../src/render/app";
+import { paletteFor, renderApp } from "../src/render/app";
 import { initialState, reduce, visibleUpdateGroups } from "../src/state";
 import { applyUpdateSnapshot, emptyUpdateLedger } from "../src/updates/ledger";
 
@@ -61,6 +61,42 @@ async function frameAt(width: number, height: number, withDetail = false, detail
 }
 
 describe("OpenTUI frames", () => {
+  test("resolves distinct light/dark palettes and ASCII app glyphs", async () => {
+    expect(paletteFor("Light", null).bg).not.toBe(paletteFor("Dark", null).bg);
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
+      state = reduce(state, { type: "appearance_move", delta: 2 });
+      state = reduce(state, { type: "appearance_cycle" });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("+");
+      expect(frame).not.toMatch(/[▸●○▾…•→·]/u);
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test("keeps no-color palette values absent while rendering normally", async () => {
+    const noColor = paletteFor("Dark", null, true);
+    expect(noColor.fg).toBeUndefined();
+    expect(noColor.bg).toBeUndefined();
+    expect(noColor.border).toBeUndefined();
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
+      state = reduce(state, { type: "appearance_move", delta: 1 });
+      state = reduce(state, { type: "appearance_cycle" });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("JIRA DESK");
+      expect(setup.renderer.listenerCount("selection")).toBeGreaterThan(0);
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
   test("preserves the complete issue key and row metadata at every supported width", async () => {
     for (const width of [60, 79, 80, 119, 120, 160]) {
       const frame = await frameAt(width, 24);
@@ -178,6 +214,31 @@ describe("OpenTUI frames", () => {
       renderApp(setup.renderer, state);
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("Other Jira activity · exact field not available from sync");
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test("ASCII converts generic activity markers but preserves Jira text punctuation", async () => {
+    const setup = await createTestRenderer({ width: 140, height: 48 });
+    try {
+      const base = { ...issue, summary: "User “quote” → middle · bullet •", status: "Open", statusCategory: "to_do" as const, updated: "2026-08-23T00:00:00Z" };
+      const changed = { ...base, summary: "Current “quote” → middle · bullet •", updated: "2026-08-24T01:02:03Z" };
+      let state = reduce(initialState({ width: 140, height: 48 }), workspaceSnapshot([base], { updatesBaselineEstablished: true }));
+      state = reduce(state, workspaceSnapshot([changed], { source: "jira", refreshedAt: "later", updates: applyUpdateSnapshot(emptyUpdateLedger(), [base], [changed]), updatesBaselineEstablished: true }));
+      const newIssue = { ...changed, id: parseIssueId("10002"), key: parseIssueKey("OTHER-987654321"), summary: "New “user” issue → intact · text •", updated: "2026-08-24T02:00:00Z" };
+      state = reduce(state, workspaceSnapshot([changed, newIssue], { source: "jira", refreshedAt: "later-2", updates: applyUpdateSnapshot(state.updates, [changed], [changed, newIssue]), updatesBaselineEstablished: true }));
+      state = reduce(state, { type: "set_section", section: "updates" });
+      state = reduce(state, { type: "appearance_move", delta: 2 });
+      state = reduce(state, { type: "appearance_cycle" });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Current “quote”");
+      expect(frame).toContain("→ middle · bullet •");
+      expect(frame).toContain("Other Jira activity . exact field not available from sync");
+      expect(frame).not.toContain("Other Jira activity · exact field not available from sync");
+      expect(frame).not.toMatch(/[┌┐└┘─│▸●○▾…]/u);
     } finally {
       setup.renderer.destroy();
     }

@@ -7,6 +7,16 @@ import type { IssueId } from "./domain";
 export type Focus = "Nav" | "Search" | "List" | "Detail" | "Composer" | "Picker" | "Settings" | "Help" | "EventLog";
 export type Section = "issues" | "updates" | "team" | "settings";
 export type ThemeMode = "System" | "Light" | "Dark";
+/** Structural preference values shared with the backend without coupling state to storage. */
+export type AppearancePreferences = Readonly<{
+  theme: ThemeMode;
+  noColor: boolean;
+  asciiOnly: boolean;
+}>;
+export type SettingsPreferences = AppearancePreferences & Readonly<{
+  jqlScope?: string;
+  teamMembers?: readonly string[];
+}>;
 export type Phase = "onboarding" | "loading" | "ready" | "error";
 export type PickerMode = "lookup" | "status" | null;
 
@@ -32,6 +42,12 @@ export type RootState = {
   layout: Layout;
   theme: ThemeMode;
   detectedTheme: "Light" | "Dark" | null;
+  activeAppearance: AppearancePreferences;
+  draftAppearance: AppearancePreferences;
+  appearanceRow: number;
+  appearanceDirty: boolean;
+  jqlScope: string | null;
+  teamMemberCount: number;
   siteLabel: string | null;
   identity: string | null;
   onboarding: Onboarding;
@@ -71,7 +87,11 @@ const event = (kind: string, message: string): SafeEvent => ({ at: new Date().to
 export function initialState(size: TerminalSize = { width: 120, height: 40 }): RootState {
   return {
     phase: "onboarding", sessionId: session(), section: "issues", focus: "Nav", size, layout: layoutFor(size),
-    theme: "System", detectedTheme: null, siteLabel: null, identity: null,
+    theme: "System", detectedTheme: null,
+    activeAppearance: { theme: "System", noColor: false, asciiOnly: false },
+    draftAppearance: { theme: "System", noColor: false, asciiOnly: false },
+    appearanceRow: 0, appearanceDirty: false, jqlScope: null, teamMemberCount: 0,
+    siteLabel: null, identity: null,
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
     issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
     detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
@@ -85,6 +105,13 @@ export type Action =
   | { type: "resize"; size: TerminalSize }
   | { type: "theme_mode"; mode: "Light" | "Dark" }
   | { type: "set_theme"; mode: ThemeMode }
+  | { type: "preferences_loaded"; preferences: SettingsPreferences }
+  | { type: "appearance_move"; delta: number }
+  | { type: "appearance_cycle" }
+  | { type: "appearance_saved"; preferences: SettingsPreferences }
+  | { type: "appearance_save_failed"; message?: string }
+  | { type: "appearance_reload_failed"; message?: string }
+  | { type: "appearance_restore" }
   | { type: "set_focus"; focus: Focus }
   | { type: "set_section"; section: Section }
   | { type: "onboarding_text"; value: string }
@@ -127,6 +154,18 @@ export type Action =
 
 function withEvent(state: RootState, kind: string, message: string): RootState {
   return { ...state, lastMessage: message, events: [...state.events, event(kind, message)].slice(-64) };
+}
+
+function appearanceFrom(preferences: SettingsPreferences): AppearancePreferences {
+  return { theme: preferences.theme, noColor: preferences.noColor, asciiOnly: preferences.asciiOnly };
+}
+
+function sameAppearance(left: AppearancePreferences, right: AppearancePreferences): boolean {
+  return left.theme === right.theme && left.noColor === right.noColor && left.asciiOnly === right.asciiOnly;
+}
+
+function withAppearance(state: RootState, draft: AppearancePreferences): RootState {
+  return { ...state, theme: draft.theme, draftAppearance: draft, appearanceDirty: !sameAppearance(draft, state.activeAppearance) };
 }
 
 function filterIssues(issues: readonly IssueSummary[], search: string, statusFilter: readonly StatusCategory[] = []): IssueSummary[] {
@@ -176,7 +215,45 @@ export function reduce(state: RootState, action: Action): RootState {
       return { ...state, size: action.size, layout, selectedIndex: clampIndex(state.selectedIndex, state.filteredIssues.length) };
     }
     case "theme_mode": return { ...state, detectedTheme: action.mode };
-    case "set_theme": return { ...state, theme: action.mode };
+    case "set_theme": return withAppearance(state, { ...state.draftAppearance, theme: action.mode });
+    case "preferences_loaded": {
+      const appearance = appearanceFrom(action.preferences);
+      return {
+        ...state,
+        theme: appearance.theme,
+        activeAppearance: appearance,
+        draftAppearance: appearance,
+        appearanceDirty: false,
+        jqlScope: action.preferences.jqlScope?.trim() || null,
+        teamMemberCount: action.preferences.teamMembers?.length ?? 0,
+      };
+    }
+    case "appearance_move": return { ...state, appearanceRow: clampIndex(state.appearanceRow + action.delta, 3) };
+    case "appearance_cycle": {
+      const row = state.appearanceRow;
+      if (row === 0) {
+        const modes: ThemeMode[] = ["System", "Light", "Dark"];
+        const index = Math.max(0, modes.indexOf(state.draftAppearance.theme));
+        return withAppearance(state, { ...state.draftAppearance, theme: modes[(index + 1) % modes.length] ?? "System" });
+      }
+      if (row === 1) return withAppearance(state, { ...state.draftAppearance, noColor: !state.draftAppearance.noColor });
+      return withAppearance(state, { ...state.draftAppearance, asciiOnly: !state.draftAppearance.asciiOnly });
+    }
+    case "appearance_saved": {
+      const appearance = appearanceFrom(action.preferences);
+      return {
+        ...state,
+        theme: appearance.theme,
+        activeAppearance: appearance,
+        draftAppearance: appearance,
+        appearanceDirty: false,
+        jqlScope: action.preferences.jqlScope?.trim() || null,
+        teamMemberCount: action.preferences.teamMembers?.length ?? 0,
+      };
+    }
+    case "appearance_save_failed": return withEvent(state, "settings", action.message ?? "Appearance could not be saved; changes remain local");
+    case "appearance_reload_failed": return withEvent(state, "settings", action.message ?? "Preferences could not be reloaded; changes remain local");
+    case "appearance_restore": return withAppearance(state, state.activeAppearance);
     case "set_focus": return { ...state, focus: action.focus };
     case "set_section": return { ...state, section: action.section, focus: action.section === "issues" || action.section === "updates" ? "List" : action.section === "settings" ? "Settings" : "Nav" };
     case "onboarding_text": {

@@ -190,4 +190,29 @@ describe("root reducer", () => {
     expect(state.overlays.help).toBe(true);
     expect(state.focus).toBe("Help");
   });
+  test("loads, previews, saves, and restores appearance preferences", () => {
+    let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "Light", noColor: true, asciiOnly: false, jqlScope: "project = DEV", teamMembers: ["ada", "grace"] } });
+    expect(state.activeAppearance).toEqual({ theme: "Light", noColor: true, asciiOnly: false });
+    expect(state.teamMemberCount).toBe(2);
+    state = reduce(state, { type: "appearance_move", delta: 1 });
+    state = reduce(state, { type: "appearance_cycle" });
+    expect(state.draftAppearance.noColor).toBe(false);
+    expect(state.appearanceDirty).toBe(true);
+    state = reduce(state, { type: "appearance_restore" });
+    expect(state.draftAppearance).toEqual(state.activeAppearance);
+    expect(state.appearanceDirty).toBe(false);
+    state = reduce(state, { type: "appearance_saved", preferences: { theme: "Dark", noColor: false, asciiOnly: true, teamMembers: [] } });
+    expect(state.activeAppearance.theme).toBe("Dark");
+    expect(state.draftAppearance.asciiOnly).toBe(true);
+    expect(state.appearanceDirty).toBe(false);
+  });
+  test("clears appearance dirty state when a preview cycles back to active", () => {
+    let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "System", noColor: false, asciiOnly: false } });
+    state = reduce(state, { type: "appearance_cycle" });
+    expect(state.appearanceDirty).toBe(true);
+    state = reduce(state, { type: "appearance_cycle" });
+    state = reduce(state, { type: "appearance_cycle" });
+    expect(state.draftAppearance).toEqual(state.activeAppearance);
+    expect(state.appearanceDirty).toBe(false);
+  });
 });

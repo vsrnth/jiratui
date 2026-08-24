@@ -220,4 +220,18 @@ describe("key handling", () => {
     expect(state.filteredIssues).toHaveLength(1);
     expect(state.updates.readIssueIds).toEqual([issue.id]);
   });
+  test("routes appearance controls without Jira refreshes", () => {
+    let state = { ...initialState(), phase: "ready" as const, section: "settings" as const, focus: "Settings" as const };
+    let result = handleKey(state, { name: "down", sequence: "\u001b[B" });
+    expect(result.state.appearanceRow).toBe(1);
+    result = handleKey(result.state, { name: "space", sequence: " " });
+    expect(result.state.appearanceDirty).toBe(true);
+    result = handleKey(result.state, { name: "s", sequence: "\u0013", ctrl: true });
+    expect(result.command).toBe("save_appearance");
+    result = handleKey(result.state, { name: "r", sequence: "\u0012", ctrl: true });
+    expect(result.command).toBe("reload_preferences");
+    expect(handleKey(result.state, { name: "r", sequence: "r" }).command).toBeNull();
+    result = handleKey(result.state, { name: "x", sequence: "x" });
+    expect(result.state.appearanceDirty).toBe(false);
+  });
 });

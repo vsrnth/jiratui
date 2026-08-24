@@ -4,14 +4,65 @@ import { STATUS_CATEGORIES, visibleUpdateGroups, type RootState } from "../state
 import type { StatusCategory } from "../protocol";
 import { GENERIC_UPDATE_LABEL, type UpdateEvent } from "../updates/ledger";
 
-const C = { fg: "#e6e1d6", dim: "#9b978d", accent: "#7dd3a3", blue: "#8ab4f8", warn: "#f2c97d", error: "#f28b82", bg: "#171817", panel: "#20221f", selected: "#2d3d35", border: "#59635b" };
+export type Palette = Readonly<{
+  fg?: string; dim?: string; accent?: string; blue?: string; warn?: string; error?: string;
+  bg?: string; panel?: string; selected?: string; border?: string;
+}>;
+
+const DARK_PALETTE: Palette = Object.freeze({ fg: "#e6e1d6", dim: "#9b978d", accent: "#7dd3a3", blue: "#8ab4f8", warn: "#f2c97d", error: "#f28b82", bg: "#171817", panel: "#20221f", selected: "#2d3d35", border: "#59635b" });
+const LIGHT_PALETTE: Palette = Object.freeze({ fg: "#1f2937", dim: "#4b5563", accent: "#087f5b", blue: "#1d4ed8", warn: "#92400e", error: "#b91c1c", bg: "#ffffff", panel: "#f3f4f6", selected: "#d1fae5", border: "#6b7280" });
+const NO_COLOR_PALETTE: Palette = Object.freeze({});
+export const ASCII_BORDER_CHARS = Object.freeze({ topLeft: "+", topRight: "+", bottomLeft: "+", bottomRight: "+", horizontal: "-", vertical: "|", topT: "+", bottomT: "+", leftT: "+", rightT: "+", cross: "+" });
+
+/** Pure palette resolution, useful to test theme behavior without a renderer. */
+export function paletteFor(theme: RootState["theme"], detectedTheme: RootState["detectedTheme"], noColor = false): Palette {
+  if (noColor) return NO_COLOR_PALETTE;
+  return (theme === "System" ? (detectedTheme ?? "Dark") : theme) === "Light" ? LIGHT_PALETTE : DARK_PALETTE;
+}
+
+let activePalette: Palette = DARK_PALETTE;
+let activeAsciiOnly = false;
+const C = new Proxy({} as Palette, { get: (_target, key: string): string | undefined => activePalette[key as keyof Palette] });
 
 type Context = CliRenderer;
 type Style = ConstructorParameters<typeof BoxRenderable>[1];
+type ScrollStyle = ConstructorParameters<typeof ScrollBoxRenderable>[1];
+type TextStyle = ConstructorParameters<typeof TextRenderable>[1];
+type LooseStyle<T extends object> = { [K in keyof T]?: T[K] | undefined } & Record<string, unknown>;
+type BoxInput = LooseStyle<Style>;
+type ScrollInput = LooseStyle<ScrollStyle>;
+type TextInput = LooseStyle<TextStyle>;
 
-function box(ctx: Context, options: Style = {}): BoxRenderable { return new BoxRenderable(ctx, { flexDirection: "column", flexShrink: 0, ...options }); }
-function text(ctx: Context, content: string, options: ConstructorParameters<typeof TextRenderable>[1] = {}): TextRenderable {
-  return new TextRenderable(ctx, { content, flexShrink: 0, ...options });
+function styledOptions<T extends Record<string, unknown>>(options: T): Record<string, unknown> {
+  const { fg, bg, backgroundColor, borderColor, titleColor, focusedBorderColor, ...rest } = options;
+  return {
+    ...rest,
+    ...(fg === undefined ? {} : { fg }),
+    ...(bg === undefined ? {} : { bg }),
+    ...(backgroundColor === undefined ? {} : { backgroundColor }),
+    ...(borderColor === undefined ? {} : { borderColor }),
+    ...(titleColor === undefined ? {} : { titleColor }),
+    ...(focusedBorderColor === undefined ? {} : { focusedBorderColor }),
+  } as T;
+}
+function borderOptions(options: Record<string, unknown>): Record<string, unknown> {
+  return activeAsciiOnly ? { ...options, customBorderChars: ASCII_BORDER_CHARS } : options;
+}
+function box(ctx: Context, options: BoxInput = {}): BoxRenderable {
+  return new BoxRenderable(ctx, borderOptions(styledOptions({ flexDirection: "column", flexShrink: 0, ...options })) as Style);
+}
+function scrollBox(ctx: Context, options: ScrollInput = {}): ScrollBoxRenderable {
+  return new ScrollBoxRenderable(ctx, borderOptions(styledOptions(options)) as ScrollStyle);
+}
+function text(ctx: Context, content: string, options: TextInput = {}): TextRenderable {
+  return new TextRenderable(ctx, styledOptions({ content, flexShrink: 0, ...options }) as TextStyle);
+}
+function appGlyphs(content: string): string {
+  if (!activeAsciiOnly) return content;
+  return content.replaceAll("▸", ">").replaceAll("●", "*").replaceAll("○", "o").replaceAll("▾", "v").replaceAll("…", "...").replaceAll("•", "*").replaceAll("→", "->").replaceAll("·", ".").replaceAll("“", '"').replaceAll("”", '"').replaceAll("↑", "^").replaceAll("↓", "v").replaceAll("←", "<");
+}
+function appText(ctx: Context, content: string, options: TextInput = {}): TextRenderable {
+  return text(ctx, appGlyphs(content), options);
 }
 function add(parent: Renderable, child: Renderable): void { parent.add(child); }
 
@@ -25,6 +76,8 @@ function statusFilterLabel(filter: readonly StatusCategory[]): string {
   return `${filter.length} statuses`;
 }
 
+function uiSeparator(): string { return activeAsciiOnly ? "." : "·"; }
+
 function clearRoot(renderer: Context): void {
   for (const child of renderer.root.getChildren()) child.destroyRecursively();
 }
@@ -32,7 +85,7 @@ function clearRoot(renderer: Context): void {
 function titleBar(ctx: Context, state: RootState): BoxRenderable {
   const header = box(ctx, { width: "100%", height: 2, backgroundColor: C.panel, paddingLeft: 1, paddingRight: 1, flexDirection: "row", alignItems: "center" });
   add(header, text(ctx, "JIRA DESK", { fg: C.accent, width: 12 }));
-  add(header, text(ctx, state.siteLabel ? `${state.siteLabel} · ${state.identity ?? ""}` : "Read-only Jira workspace", { fg: C.dim, flexGrow: 1, width: "auto" }));
+  add(header, text(ctx, state.siteLabel ? `${state.siteLabel} ${uiSeparator()} ${state.identity ?? ""}` : "Read-only Jira workspace", { fg: C.dim, flexGrow: 1, width: "auto" }));
   add(header, text(ctx, state.theme === "System" ? `System/${state.detectedTheme ?? "?"}` : state.theme, { fg: C.dim, width: 18 }));
   return header;
 }
@@ -40,7 +93,7 @@ function titleBar(ctx: Context, state: RootState): BoxRenderable {
 function footer(ctx: Context, state: RootState): BoxRenderable {
   const footer = box(ctx, { width: "100%", height: 2, backgroundColor: C.panel, paddingLeft: 1, flexDirection: "row", alignItems: "center" });
   add(footer, text(ctx, state.lastMessage ?? "? Help   e Events   / Search   s Status filter   l Lookup   r Refresh   Enter Detail   q Quit", { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
-  add(footer, text(ctx, `${state.focus} · ${state.layout.mode}`, { fg: C.dim, width: 24 }));
+  add(footer, appText(ctx, `${state.focus} · ${state.layout.mode}`, { fg: C.dim, width: 24 }));
   return footer;
 }
 
@@ -50,20 +103,20 @@ function onboarding(ctx: Context, state: RootState): BoxRenderable {
   const fields: Array<[string, string, boolean]> = [["Jira HTTPS URL", state.onboarding.baseUrl, state.onboarding.field === "baseUrl"], ["Atlassian email", state.onboarding.email, state.onboarding.field === "email"], ["Scoped API token", maskedSecret(state.onboarding.token), state.onboarding.field === "token"], ["Remember securely", state.onboarding.remember ? "[x]" : "[ ]", state.onboarding.field === "remember"]];
   for (const [label, value, selected] of fields) {
     const row = box(ctx, { width: "100%", height: 3, border: true, borderColor: selected ? C.accent : C.border, paddingLeft: 1, paddingRight: 1 });
-    add(row, text(ctx, `${selected ? "▸" : " "} ${label}`, { fg: selected ? C.accent : C.dim }));
+    add(row, appText(ctx, `${selected ? "▸" : " "} ${label}`, { fg: selected ? C.accent : C.dim }));
     add(row, text(ctx, value || "(required)", { fg: value ? C.fg : C.dim }));
     add(panel, row);
   }
   add(panel, text(ctx, "Tab/Shift-Tab field   Enter advance/connect   Space toggle remember", { fg: C.dim }));
   add(panel, text(ctx, "Ctrl-G clear token   Esc cancel connection   Paste supported in token field", { fg: C.dim }));
-  if (state.onboarding.submitting) add(panel, text(ctx, "Checking credentials…", { fg: C.warn }));
+  if (state.onboarding.submitting) add(panel, appText(ctx, "Checking credentials…", { fg: C.warn }));
   if (state.onboarding.error) add(panel, text(ctx, `Error: ${state.onboarding.error}`, { fg: C.error }));
   return panel;
 }
 
 function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRenderable {
   const filterLabel = statusFilterLabel(state.statusFilter);
-  const scroll = new ScrollBoxRenderable(ctx, { width, height: "100%", border: true, borderColor: state.focus === "List" ? C.accent : C.border, title: ` ISSUES (${state.filteredIssues.length}) · FILTER: ${filterLabel} `, scrollY: true, flexShrink: 0 });
+  const scroll = scrollBox(ctx, { width, height: "100%", border: true, borderColor: state.focus === "List" ? C.accent : C.border, title: ` ISSUES (${state.filteredIssues.length}) ${uiSeparator()} FILTER: ${filterLabel} `, scrollY: true, flexShrink: 0 });
   scroll.scrollTop = state.scroll.list;
   for (let index = 0; index < state.filteredIssues.length; index += 1) {
     const issue = state.filteredIssues[index];
@@ -73,9 +126,9 @@ function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRend
     // particular, the key is allowed to wrap instead of being squeezed into a
     // fixed column or replaced with an ellipsis.
     const row = box(ctx, { width: "100%", minWidth: 30, height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
-    if (selected) row.backgroundColor = C.selected;
-    add(row, text(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: "100%", wrapMode: "char" }));
-    add(row, text(ctx, `${issue.status} · ${issue.priority} · ${issue.assignee}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    if (selected && C.selected) row.backgroundColor = C.selected;
+    add(row, appText(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: "100%", wrapMode: "char" }));
+    add(row, text(ctx, `${issue.status} ${uiSeparator()} ${issue.priority} ${uiSeparator()} ${issue.assignee}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(row, text(ctx, `Updated ${issue.updated}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(row, text(ctx, issue.summary, { fg: C.fg, width: "100%", wrapMode: "word" }));
     add(scroll, row);
@@ -95,27 +148,27 @@ function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRend
 
 function statusPicker(ctx: Context, state: RootState): BoxRenderable {
   const panel = box(ctx, { position: "absolute", top: 3, left: 6, width: "48%", height: 10, zIndex: 8, backgroundColor: C.bg, border: true, borderColor: C.accent, padding: 1, title: " STATUS FILTER " });
-  add(panel, text(ctx, "Space toggle · Enter apply · Esc cancel", { fg: C.dim }));
+  add(panel, appText(ctx, "Space toggle · Enter apply · Esc cancel", { fg: C.dim }));
   for (let index = 0; index < STATUS_CATEGORIES.length; index += 1) {
     const category = STATUS_CATEGORIES[index];
     if (!category) continue;
     const selected = index === state.statusPickerIndex;
     const checked = state.statusDraft.includes(category);
-    add(panel, text(ctx, `${selected ? "▸" : " "} [${checked ? "x" : " "}] ${statusCategoryLabel(category)}`, { fg: selected ? C.accent : C.fg }));
+    add(panel, appText(ctx, `${selected ? "▸" : " "} [${checked ? "x" : " "}] ${statusCategoryLabel(category)}`, { fg: selected ? C.accent : C.fg }));
   }
   return panel;
 }
 
 function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRenderable {
-  const scroll = new ScrollBoxRenderable(ctx, { width, height: "100%", border: true, borderColor: state.focus === "Detail" ? C.accent : C.border, title: state.detail?.issue.key ? ` ${state.detail.issue.key} ` : " DETAIL ", scrollY: true, flexShrink: 0 });
+  const scroll = scrollBox(ctx, { width, height: "100%", border: true, borderColor: state.focus === "Detail" ? C.accent : C.border, title: state.detail?.issue.key ? ` ${state.detail.issue.key} ` : " DETAIL ", scrollY: true, flexShrink: 0 });
   scroll.scrollTop = state.scroll.detail;
-  if (state.detailLoading) { add(scroll, text(ctx, "Loading issue detail…", { fg: C.warn, paddingLeft: 1 })); return scroll; }
+  if (state.detailLoading) { add(scroll, appText(ctx, "Loading issue detail…", { fg: C.warn, paddingLeft: 1 })); return scroll; }
   if (state.detailError) { add(scroll, text(ctx, state.detailError, { fg: C.error, paddingLeft: 1 })); return scroll; }
   if (!state.detail) { add(scroll, text(ctx, "Select an issue and press Enter.", { fg: C.dim, paddingLeft: 1 })); return scroll; }
   const detailText = (content: string, color = C.fg, paddingLeft = 1): void => add(scroll, text(ctx, content, { fg: color, paddingLeft, width: "100%", wrapMode: "word" }));
   detailText(state.detail.issue.summary, C.accent);
-  detailText(`${state.detail.remote ? "REMOTE" : "WORKSPACE"} · ${state.detail.issue.key}`, C.blue);
-  detailText(`${state.detail.issue.status} · ${state.detail.issue.priority} · ${state.detail.issue.assignee}`, C.dim);
+  detailText(`${state.detail.remote ? "REMOTE" : "WORKSPACE"} ${uiSeparator()} ${state.detail.issue.key}`, C.blue);
+  detailText(`${state.detail.issue.status} ${uiSeparator()} ${state.detail.issue.priority} ${uiSeparator()} ${state.detail.issue.assignee}`, C.dim);
   detailText(`Type: ${state.detail.issueType}`);
   detailText(`Reporter: ${state.detail.reporter}`);
   detailText(`Project: ${state.detail.project}`);
@@ -127,9 +180,9 @@ function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRen
   add(scroll, text(ctx, "DESCRIPTION", { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
   detailText(state.detail.description || "(no description)");
   add(scroll, text(ctx, `COMMENTS (${state.detail.comments.length})`, { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
-  for (const comment of state.detail.comments) { detailText(`${comment.author} · ${comment.created}`, C.dim); detailText(comment.body, C.fg, 2); }
+  for (const comment of state.detail.comments) { detailText(`${comment.author} ${uiSeparator()} ${comment.created}`, C.dim); detailText(comment.body, C.fg, 2); }
   add(scroll, text(ctx, `ATTACHMENTS (${state.detail.attachments.length})`, { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
-  for (const attachment of state.detail.attachments) detailText(`${attachment.filename} · ${attachment.mimeType} · ${attachment.sizeBytes} bytes`, C.dim);
+  for (const attachment of state.detail.attachments) detailText(`${attachment.filename} ${uiSeparator()} ${attachment.mimeType} ${uiSeparator()} ${attachment.sizeBytes} bytes`, C.dim);
   return scroll;
 }
 
@@ -147,8 +200,11 @@ function updateTimestamp(value: string): string {
 }
 
 function updateRowLabel(event: UpdateEvent): string {
-  if (event.field === "other") return event.label || GENERIC_UPDATE_LABEL;
-  return `${event.label}: ${event.previousValue ?? "(none)"} → ${event.currentValue ?? "(none)"}`;
+  if (event.field === "other") {
+    const label = event.label || GENERIC_UPDATE_LABEL;
+    return label === GENERIC_UPDATE_LABEL ? appGlyphs(label) : label;
+  }
+  return `${event.label}: ${event.previousValue ?? "(none)"} ${activeAsciiOnly ? "->" : "→"} ${event.currentValue ?? "(none)"}`;
 }
 
 function updatesView(ctx: Context, state: RootState): BoxRenderable {
@@ -159,24 +215,24 @@ function updatesView(ctx: Context, state: RootState): BoxRenderable {
     height: "100%",
     border: true,
     borderColor: state.focus === "List" ? C.accent : C.border,
-    title: ` LOCAL UPDATES · ${state.updateFilter.toUpperCase()} · ${unreadCount} unread `,
+    title: ` LOCAL UPDATES ${uiSeparator()} ${state.updateFilter.toUpperCase()} ${uiSeparator()} ${unreadCount} unread `,
     padding: 1,
   });
-  add(panel, text(ctx, "u Unread/All · m Toggle read · M Mark displayed read · Space/o Expand · Enter Detail · r Local reload", { fg: C.dim, width: "100%", wrapMode: "word" }));
+  add(panel, appText(ctx, "u Unread/All · m Toggle read · M Mark displayed read · Space/o Expand · Enter Detail · r Local reload", { fg: C.dim, width: "100%", wrapMode: "word" }));
   if (state.confirmMarkAllUpdates) add(panel, text(ctx, "Mark all displayed updates read?  y Confirm · n/Esc Cancel", { fg: C.warn, width: "100%", wrapMode: "word" }));
-  const scroll = new ScrollBoxRenderable(ctx, { width: "100%", height: "100%", border: false, scrollY: true, flexGrow: 1 });
+  const scroll = scrollBox(ctx, { width: "100%", height: "100%", border: false, scrollY: true, flexGrow: 1 });
   scroll.scrollTop = state.scroll.updates;
   for (let index = 0; index < groups.length; index += 1) {
     const group = groups[index];
     if (!group) continue;
     const selected = index === state.selectedUpdateIndex;
     const card = box(ctx, { width: "100%", height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
-    if (selected) card.backgroundColor = C.selected;
-    add(card, text(ctx, `${selected ? "▸" : " "} ${group.unread ? "●" : "○"} ${group.expanded ? "▾" : "▸"} ${group.issueKey}`, { fg: selected ? C.accent : group.unread ? C.warn : C.blue, width: "100%", wrapMode: "char" }));
+    if (selected && C.selected) card.backgroundColor = C.selected;
+    add(card, appText(ctx, `${selected ? "▸" : " "} ${group.unread ? "●" : "○"} ${group.expanded ? "▾" : "▸"} ${group.issueKey}`, { fg: selected ? C.accent : group.unread ? C.warn : C.blue, width: "100%", wrapMode: "char" }));
     add(card, text(ctx, group.issueSummary, { fg: C.fg, width: "100%", wrapMode: "word" }));
-    add(card, text(ctx, `Latest ${updateTimestamp(group.latestAt)} · ${group.events.length} change${group.events.length === 1 ? "" : "s"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
-    for (const event of group.rows) add(card, text(ctx, `  • ${updateRowLabel(event)}`, { fg: event.field === "other" ? C.dim : C.fg, width: "100%", wrapMode: "word" }));
-    if (!group.expanded && group.events.length > group.rows.length) add(card, text(ctx, `  … ${group.events.length - group.rows.length} more (Space/o to expand)`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(card, appText(ctx, `Latest ${updateTimestamp(group.latestAt)} · ${group.events.length} change${group.events.length === 1 ? "" : "s"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    for (const event of group.rows) add(card, text(ctx, `  ${activeAsciiOnly ? "*" : "•"} ${updateRowLabel(event)}`, { fg: event.field === "other" ? C.dim : C.fg, width: "100%", wrapMode: "word" }));
+    if (!group.expanded && group.events.length > group.rows.length) add(card, appText(ctx, `  … ${group.events.length - group.rows.length} more (Space/o to expand)`, { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(scroll, card);
   }
   if (groups.length === 0) add(scroll, text(ctx, state.updateFilter === "unread" ? "No unread updates" : "No local updates yet. Refresh Jira to compare a later snapshot.", { fg: C.dim, paddingLeft: 1, width: "100%", wrapMode: "word" }));
@@ -184,11 +240,11 @@ function updatesView(ctx: Context, state: RootState): BoxRenderable {
   return panel;
 }
 
-function overlay(ctx: Context, title: string, lines: string[], focus: RootState["focus"]): BoxRenderable {
+function overlay(ctx: Context, title: string, lines: string[], focus: RootState["focus"], appContent = false): BoxRenderable {
   const panel = box(ctx, { position: "absolute", top: 2, left: 4, width: "80%", height: "80%", zIndex: 10, backgroundColor: C.bg, border: true, borderColor: C.accent, padding: 1, title: ` ${title} ` });
   add(panel, text(ctx, `Focus: ${focus}   Esc close`, { fg: C.dim }));
-  const scroll = new ScrollBoxRenderable(ctx, { width: "100%", height: "100%", scrollY: true, border: false });
-  for (const line of lines) add(scroll, text(ctx, line, { fg: C.fg }));
+  const scroll = scrollBox(ctx, { width: "100%", height: "100%", scrollY: true, border: false });
+  for (const line of lines) add(scroll, appContent ? appText(ctx, line, { fg: C.fg }) : text(ctx, line, { fg: C.fg }));
   add(panel, scroll); return panel;
 }
 
@@ -204,10 +260,28 @@ function secondarySection(ctx: Context, state: RootState): BoxRenderable {
     padding: 2,
   });
   if (state.section === "settings") {
+    add(panel, appText(ctx, `Appearance${state.appearanceDirty ? " *" : ""}`, { fg: C.blue }));
+    const appearanceRows = [
+      ["Theme", state.draftAppearance.theme],
+      ["No color", state.draftAppearance.noColor ? "On" : "Off"],
+      ["ASCII-only", state.draftAppearance.asciiOnly ? "On" : "Off"],
+    ] as const;
+    for (let index = 0; index < appearanceRows.length; index += 1) {
+      const row = appearanceRows[index];
+      if (!row) continue;
+      const selected = index === state.appearanceRow;
+      const marker = selected ? (activeAsciiOnly ? ">" : "▸") : " ";
+      add(panel, appText(ctx, `${marker} ${row[0]}: ${row[1]}${state.appearanceDirty ? " *" : ""}`, { fg: selected ? C.accent : C.fg, paddingTop: index === 0 ? 1 : 0 }));
+    }
+    add(panel, appText(ctx, "j/k or arrows select · Space/Enter change · Ctrl-s save · Ctrl-r reload · x restore", { fg: C.dim, paddingTop: 1, width: "100%", wrapMode: "word" }));
+    const scope = state.jqlScope ? state.jqlScope.slice(0, 120) : "Default";
+    add(panel, text(ctx, `Active Jira scope: ${scope}`, { fg: C.fg, paddingTop: 1, width: "100%", wrapMode: "word" }));
+    add(panel, text(ctx, `Team members configured: ${state.teamMemberCount}`, { fg: C.fg, width: "100%" }));
+    add(panel, appText(ctx, "JQL scope and team membership are read-only summaries here; editing is not available yet.", { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(panel, text(ctx, "Saved login", { fg: C.blue }));
     add(panel, text(ctx, "Stored with Bun.secrets (macOS Keychain / Linux libsecret).", { fg: C.fg }));
     add(panel, text(ctx, "No plaintext fallback. The current session stays connected after removal.", { fg: C.dim }));
-    add(panel, text(ctx, state.confirmForgetLogin ? "Forget saved login?  y Confirm · n Cancel" : "f Forget saved login", { fg: state.confirmForgetLogin ? C.warn : C.accent, paddingTop: 1 }));
+    add(panel, appText(ctx, state.confirmForgetLogin ? "Forget saved login?  y Confirm · n Cancel" : "f Forget saved login", { fg: state.confirmForgetLogin ? C.warn : C.accent, paddingTop: 1 }));
   } else {
     add(panel, text(ctx, "This screen is reserved for a later read-only milestone.", { fg: C.dim }));
     add(panel, text(ctx, "Issues, exact lookup, detail, comments, and attachment metadata are available now.", { fg: C.fg, paddingTop: 1 }));
@@ -220,6 +294,10 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
   // the emitter warning-free for legitimate frames; recursive root cleanup
   // prevents those listeners from accumulating across redraws.
   renderer.setMaxListeners(0);
+  // Renderable construction is synchronous. A frame-local palette avoids
+  // leaking renderer state into the reducer or any asynchronous operation.
+  activePalette = paletteFor(state.theme, state.detectedTheme, state.draftAppearance.noColor);
+  activeAsciiOnly = state.draftAppearance.asciiOnly;
   clearRoot(renderer);
   const root = box(renderer, { width: "100%", height: "100%", backgroundColor: C.bg });
   add(root, titleBar(renderer, state));
@@ -231,7 +309,7 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
     } else {
       if (state.layout.nav) {
         const nav = box(renderer, { width: state.layout.nav.width, height: "100%", border: true, borderColor: state.focus === "Nav" ? C.accent : C.border, padding: 1, flexShrink: 0 });
-        for (const [key, label] of [["1", "Issues"], ["2", "Updates"], ["3", "Team"], ["4", "Settings"]] as const) add(nav, text(renderer, `${state.focus === "Nav" && state.section.toLowerCase() === label.toLowerCase() ? "▸" : " "} ${key} ${label}`, { fg: C.fg }));
+        for (const [key, label] of [["1", "Issues"], ["2", "Updates"], ["3", "Team"], ["4", "Settings"]] as const) add(nav, appText(renderer, `${state.focus === "Nav" && state.section.toLowerCase() === label.toLowerCase() ? "▸" : " "} ${key} ${label}`, { fg: C.fg }));
         add(main, nav);
       }
       const listWidth = state.layout.list.width;
@@ -245,14 +323,14 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
       }
       if (state.focus === "Picker" && state.pickerMode !== "status") add(main, text(renderer, `Exact issue key: ${state.lookupEditor || "_"}`, { fg: C.accent, position: "absolute", top: 0, left: 1, zIndex: 5 }));
       if (state.layout.event) {
-        const log = new ScrollBoxRenderable(renderer, { width: state.layout.event.width, height: "100%", border: true, borderColor: C.border, title: " EVENTS ", scrollY: true, flexShrink: 0 });
+        const log = scrollBox(renderer, { width: state.layout.event.width, height: "100%", border: true, borderColor: C.border, title: " EVENTS ", scrollY: true, flexShrink: 0 });
         log.scrollTop = state.scroll.eventLog; for (const item of state.events) add(log, text(renderer, `${item.kind}: ${item.message}`, { fg: C.dim })); add(main, log);
       }
     }
     add(root, main);
   }
   add(root, footer(renderer, state));
-  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus));
+  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "Ctrl-s save appearance · Ctrl-r reload preferences · x restore active appearance", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus, true));
   if (state.overlays.eventLog) add(root, overlay(renderer, "EVENT LOG", state.events.map((item) => `${item.at} ${item.kind}: ${item.message}`), state.focus));
   if (state.focus === "Picker" && state.pickerMode === "status") add(root, statusPicker(renderer, state));
   renderer.root.add(root);
