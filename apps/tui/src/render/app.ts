@@ -1,6 +1,6 @@
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer, type Renderable } from "@opentui/core";
 import { maskedSecret } from "../secure-input";
-import { MAX_JQL_SCOPE_BYTES, STATUS_CATEGORIES, visibleUpdateGroups, type RootState } from "../state";
+import { MAX_JQL_SCOPE_BYTES, MAX_TEAM_MEMBERS_BYTES, STATUS_CATEGORIES, visibleUpdateGroups, type RootState } from "../state";
 import type { StatusCategory } from "../protocol";
 import { GENERIC_UPDATE_LABEL, type UpdateEvent } from "../updates/ledger";
 
@@ -52,7 +52,13 @@ function box(ctx: Context, options: BoxInput = {}): BoxRenderable {
   return new BoxRenderable(ctx, borderOptions(styledOptions({ flexDirection: "column", flexShrink: 0, ...options })) as Style);
 }
 function scrollBox(ctx: Context, options: ScrollInput = {}): ScrollBoxRenderable {
-  return new ScrollBoxRenderable(ctx, borderOptions(styledOptions(options)) as ScrollStyle);
+  const scroll = new ScrollBoxRenderable(ctx, borderOptions(styledOptions(options)) as ScrollStyle);
+  // Keep scrolling stateful and keyboard-accessible, but leave scrollbar
+  // chrome out of the frame. OpenTUI otherwise briefly paints a native thumb
+  // when selection changes or content is measured.
+  scroll.verticalScrollBar.visible = false;
+  scroll.horizontalScrollBar.visible = false;
+  return scroll;
 }
 function text(ctx: Context, content: string, options: TextInput = {}): TextRenderable {
   return new TextRenderable(ctx, styledOptions({ content, flexShrink: 0, ...options }) as TextStyle);
@@ -92,7 +98,7 @@ function titleBar(ctx: Context, state: RootState): BoxRenderable {
 
 function footer(ctx: Context, state: RootState): BoxRenderable {
   const footer = box(ctx, { width: "100%", height: 2, backgroundColor: C.panel, paddingLeft: 1, flexDirection: "row", alignItems: "center" });
-  add(footer, text(ctx, state.lastMessage ?? "? Help   e Events   / Search   s Status filter   l Lookup   r Refresh   Enter Detail   q Quit", { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
+  add(footer, text(ctx, state.lastMessage ?? (state.section === "team" ? "? Help   j/k Select   r Refresh Team   Enter Remote detail   4 Settings   q Quit" : "? Help   e Events   / Search   s Status filter   l Lookup   r Refresh   Enter Detail   q Quit"), { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
   add(footer, appText(ctx, `${state.focus} · ${state.layout.mode}`, { fg: C.dim, width: 24 }));
   return footer;
 }
@@ -240,6 +246,42 @@ function updatesView(ctx: Context, state: RootState): BoxRenderable {
   return panel;
 }
 
+function teamAge(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "activity time unavailable";
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return "age <1m";
+  if (seconds < 3600) return `age ${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `age ${Math.floor(seconds / 3600)}h`;
+  return `age ${Math.floor(seconds / 86400)}d`;
+}
+
+function teamView(ctx: Context, state: RootState): BoxRenderable {
+  const panel = box(ctx, { width: "100%", height: "100%", border: true, borderColor: state.focus === "List" ? C.accent : C.border, title: ` TEAM TRACKER ${uiSeparator()} ${state.teamSource ?? "local"} `, padding: 1 });
+  add(panel, appText(ctx, "j/k or arrows select · Enter open remote detail · r refresh Team", { fg: C.dim, width: "100%", wrapMode: "word" }));
+  if (state.teamLoading) add(panel, appText(ctx, "Loading Team issues…", { fg: C.warn }));
+  if (state.teamError) add(panel, text(ctx, state.teamError, { fg: C.error, width: "100%", wrapMode: "word" }));
+  if (state.teamRefreshedAt) add(panel, text(ctx, `Updated ${state.teamRefreshedAt}`, { fg: C.dim, width: "100%" }));
+  const scroll = scrollBox(ctx, { width: "100%", height: "100%", border: false, scrollY: true, flexGrow: 1 });
+  scroll.scrollTop = state.scroll.team;
+  for (let index = 0; index < state.teamIssues.length; index += 1) {
+    const issue = state.teamIssues[index];
+    if (!issue) continue;
+    const selected = index === state.teamSelectedIndex;
+    const row = box(ctx, { width: "100%", height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
+    if (selected && C.selected) row.backgroundColor = C.selected;
+    add(row, appText(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: "100%", wrapMode: "char" }));
+    // Jira/user text goes through text(), retaining Unicode even in ASCII mode.
+    add(row, text(ctx, issue.summary, { fg: C.fg, width: "100%", wrapMode: "word" }));
+    add(row, text(ctx, `${issue.assignee} ${uiSeparator()} ${issue.status}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(row, text(ctx, `Updated ${issue.updated || "unknown"} ${uiSeparator()} ${teamAge(issue.updated)}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(scroll, row);
+  }
+  if (state.teamIssues.length === 0 && !state.teamLoading && !state.teamError) add(scroll, text(ctx, "No team issues yet. Configure Team members in Settings, then press r to refresh.", { fg: C.dim, width: "100%", wrapMode: "word" }));
+  add(panel, scroll);
+  return panel;
+}
+
 function overlay(ctx: Context, title: string, lines: string[], focus: RootState["focus"], appContent = false): BoxRenderable {
   const panel = box(ctx, { position: "absolute", top: 2, left: 4, width: "80%", height: "80%", zIndex: 10, backgroundColor: C.bg, border: true, borderColor: C.accent, padding: 1, title: ` ${title} ` });
   add(panel, text(ctx, `Focus: ${focus}   Esc close`, { fg: C.dim }));
@@ -263,6 +305,7 @@ function secondarySection(ctx: Context, state: RootState): BoxRenderable {
     add(panel, appText(ctx, `Settings${state.appearanceDirty ? " *" : ""}`, { fg: C.blue }));
     const settingsRows = [
       ["Jira scope", state.scopeEditing ? (state.scopeDraft || "(empty)") : (state.jqlScope || "Default")],
+      ["Team members", state.teamMembersEditing ? (state.teamMembersDraft.split("\n").filter(Boolean).length.toString()) : `${state.teamMemberCount}`],
       ["Theme", state.draftAppearance.theme],
       ["No color", state.draftAppearance.noColor ? "On" : "Off"],
       ["ASCII-only", state.draftAppearance.asciiOnly ? "On" : "Off"],
@@ -273,7 +316,7 @@ function secondarySection(ctx: Context, state: RootState): BoxRenderable {
       const selected = index === state.settingsRow;
       const marker = selected ? (activeAsciiOnly ? ">" : "▸") : " ";
       const scopeProgress = state.scopeSaving && index === 0 ? (activeAsciiOnly ? " ..." : " …") : "";
-      const dirty = index > 0 && state.appearanceDirty ? " *" : "";
+      const dirty = index === 1 && state.teamMembersEditing ? " *" : index > 1 && state.appearanceDirty ? " *" : "";
       add(panel, index === 0
         ? text(ctx, `${marker} ${row[0]}: ${row[1]}${scopeProgress}`, { fg: selected ? C.accent : C.fg, paddingTop: 1, width: "100%", wrapMode: "word" })
         : appText(ctx, `${marker} ${row[0]}: ${row[1]}${dirty}`, { fg: selected ? C.accent : C.fg }));
@@ -286,10 +329,18 @@ function secondarySection(ctx: Context, state: RootState): BoxRenderable {
       add(panel, appText(ctx, `${new TextEncoder().encode(state.scopeDraft).byteLength}/${MAX_JQL_SCOPE_BYTES} UTF-8 bytes${state.scopeSaving ? " · Saving…" : ""}`, { fg: state.scopeSaving ? C.warn : C.dim }));
       if (state.scopeError) add(panel, text(ctx, `Error: ${state.scopeError}`, { fg: C.error, width: "100%", wrapMode: "word" }));
       add(panel, appText(ctx, "Ctrl-s save · Esc close/cancel save · x restore active · Paste supported", { fg: C.dim, width: "100%", wrapMode: "word" }));
+    } else if (state.teamMembersEditing) {
+      add(panel, text(ctx, "Team members editor", { fg: C.blue, paddingTop: 1 }));
+      add(panel, text(ctx, state.teamMembersDraft || "_", { fg: C.fg, width: "100%", wrapMode: "word" }));
+      add(panel, text(ctx, `Attempted: ${state.teamMembersDraft || "(empty)"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+      add(panel, text(ctx, `Active: ${state.teamMembers.length ? state.teamMembers.join("\n") : "(empty)"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+      add(panel, appText(ctx, `${new TextEncoder().encode(state.teamMembersDraft).byteLength}/${MAX_TEAM_MEMBERS_BYTES} UTF-8 bytes${state.teamMembersSaving ? " · Saving…" : ""}`, { fg: state.teamMembersSaving ? C.warn : C.dim }));
+      if (state.teamMembersError) add(panel, text(ctx, `Error: ${state.teamMembersError}`, { fg: C.error, width: "100%", wrapMode: "word" }));
+      add(panel, appText(ctx, "Enter newline · Ctrl-s save · Esc close/cancel save · x restore active · Paste supported", { fg: C.dim, width: "100%", wrapMode: "word" }));
     } else {
       add(panel, appText(ctx, "j/k or arrows select · Space/Enter edit or change · Ctrl-s save · Ctrl-r reload · x restore", { fg: C.dim, paddingTop: 1, width: "100%", wrapMode: "word" }));
     }
-    add(panel, text(ctx, `Team members configured: ${state.teamMemberCount}`, { fg: C.fg, width: "100%" }));
+      add(panel, text(ctx, `Team members configured: ${state.teamMemberCount}`, { fg: C.fg, width: "100%" }));
     add(panel, appText(ctx, "Team membership is a summary; Jira scope is read-only in Jira and controls this workspace query.", { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(panel, text(ctx, "Saved login", { fg: C.blue }));
     add(panel, text(ctx, "Stored with Bun.secrets (macOS Keychain / Linux libsecret).", { fg: C.fg }));
@@ -326,7 +377,13 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
         add(main, nav);
       }
       const listWidth = state.layout.list.width;
-      if (state.section !== "issues") {
+      if (state.section === "team") {
+        if (state.layout.mode === "one-pane" && state.focus === "Detail") add(main, detailView(renderer, state, listWidth));
+        else {
+          add(main, teamView(renderer, state));
+          if (state.layout.detail && state.layout.mode !== "one-pane") add(main, detailView(renderer, state, state.layout.detail.width));
+        }
+      } else if (state.section !== "issues") {
         add(main, secondarySection(renderer, state));
       } else if (state.layout.mode === "one-pane" && state.focus === "Detail") {
         add(main, detailView(renderer, state, listWidth));
@@ -343,7 +400,7 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
     add(root, main);
   }
   add(root, footer(renderer, state));
-  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "Settings: Jira scope row Space/Enter edit · Ctrl-s save · Esc close/cancel · x restore active", "Settings: Theme/No color/ASCII-only rows cycle with Space/Enter", "Ctrl-s save appearance · Ctrl-r reload preferences", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus, true));
+  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh Jira (Issues) or Team (Team)", "Team: Enter opens remote detail without changing primary membership", "Settings: Jira scope row Space/Enter edit · Ctrl-s save · Esc close/cancel · x restore active", "Settings: Team members row always opens multiline editor; Enter newline · Ctrl-s save", "Settings: Theme/No color/ASCII-only rows cycle with Space/Enter", "Ctrl-s saves the selected settings row", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus, true));
   if (state.overlays.eventLog) add(root, overlay(renderer, "EVENT LOG", state.events.map((item) => `${item.at} ${item.kind}: ${item.message}`), state.focus));
   if (state.focus === "Picker" && state.pickerMode === "status") add(root, statusPicker(renderer, state));
   renderer.root.add(root);

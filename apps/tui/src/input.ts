@@ -1,8 +1,8 @@
 import { backspaceSecret, deleteSecret, editSecret, moveSecret } from "./secure-input";
-import { MAX_JQL_SCOPE_BYTES, reduce, type Action, type Focus, type RootState } from "./state";
+import { MAX_JQL_SCOPE_BYTES, MAX_TEAM_MEMBERS_BYTES, reduce, type Action, type Focus, type RootState } from "./state";
 
 export type KeyLike = { name?: string; sequence?: string; ctrl?: boolean; shift?: boolean; meta?: boolean };
-export type InputCommand = "quit" | "connect" | "cancel_connect" | "cancel_scope_save" | "refresh" | "reload_preferences" | "save_appearance" | "save_jql_scope" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
+export type InputCommand = "quit" | "connect" | "cancel_connect" | "cancel_scope_save" | "cancel_team_members_save" | "refresh" | "refresh_team" | "reload_preferences" | "save_appearance" | "save_jql_scope" | "save_team_members" | "detail" | "team_detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
 export type InputResult = { state: RootState; command: InputCommand };
 const focusOrder: Focus[] = ["Nav", "Search", "List", "Detail", "Composer", "Picker", "Settings"];
 
@@ -42,6 +42,25 @@ export function pasteJqlScope(current: string, bytes: Uint8Array): string | null
   const value = decodeJqlPaste(bytes);
   if (value === null) return null;
   return new TextEncoder().encode(current + value).byteLength <= MAX_JQL_SCOPE_BYTES ? value : null;
+}
+
+/** Strict paste decoder for the multiline team editor. LF and CRLF delimiters
+ * are the only controls accepted; every other control rejects the whole paste. */
+export function decodeTeamMembersPaste(bytes: Uint8Array): string | null {
+  try {
+    const value = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (!value || /\r(?!\n)/u.test(value)) return null;
+    const normalized = value.replaceAll("\r\n", "\n");
+    if (normalized.split("\n").some((line) => CONTROL_CHARACTER.test(line))) return null;
+    return new TextEncoder().encode(normalized).byteLength <= MAX_TEAM_MEMBERS_BYTES ? normalized : null;
+  } catch { return null; }
+}
+
+export function pasteTeamMembers(current: string, bytes: Uint8Array): string | null {
+  const value = decodeTeamMembersPaste(bytes);
+  if (value === null) return null;
+  const combined = current + value;
+  return new TextEncoder().encode(combined).byteLength <= MAX_TEAM_MEMBERS_BYTES ? value : null;
 }
 
 export function handleKey(state: RootState, key: KeyLike): InputResult {
@@ -101,6 +120,10 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     if (name === "escape") return { state: reduce(state, { type: "scope_save_cancel" }), command: "cancel_scope_save" };
     return { state, command: null };
   }
+  if (state.teamMembersSaving) {
+    if (name === "escape") return { state: reduce(state, { type: "team_members_save_cancel" }), command: "cancel_team_members_save" };
+    return { state, command: null };
+  }
   if (state.section === "settings" && state.scopeEditing) {
     if (name === "escape") return { state: reduce(state, { type: "scope_edit_cancel" }), command: null };
     if (key.ctrl && name === "s") return { state, command: "save_jql_scope" };
@@ -109,6 +132,18 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     const scopeText = key.sequence ?? "";
     if (!key.ctrl && !key.meta && Array.from(scopeText).length === 1 && !CONTROL_CHARACTER.test(scopeText)) {
       return { state: reduce(state, { type: "scope_edit_insert", value: scopeText }), command: null };
+    }
+    return { state, command: null };
+  }
+  if (state.section === "settings" && state.teamMembersEditing) {
+    if (name === "escape") return { state: reduce(state, { type: "team_members_edit_cancel" }), command: null };
+    if (key.ctrl && name === "s") return { state, command: "save_team_members" };
+    if (name === "x") return { state: reduce(state, { type: "team_members_restore" }), command: null };
+    if (name === "backspace") return { state: reduce(state, { type: "team_members_edit_backspace" }), command: null };
+    if (name === "enter") return { state: reduce(state, { type: "team_members_edit_newline" }), command: null };
+    const memberText = key.sequence ?? "";
+    if (!key.ctrl && !key.meta && Array.from(memberText).length === 1 && !CONTROL_CHARACTER.test(memberText)) {
+      return { state: reduce(state, { type: "team_members_edit_insert", value: memberText }), command: null };
     }
     return { state, command: null };
   }
@@ -143,12 +178,20 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
   const sections = { "1": "issues", "2": "updates", "3": "team", "4": "settings" } as const;
   if (name in sections) return { state: reduce(state, { type: "set_section", section: sections[name as keyof typeof sections] }), command: null };
   if (state.section === "settings") {
-    if (key.ctrl && name === "s") return { state, command: state.settingsRow === 0 ? "save_jql_scope" : "save_appearance" };
+    if (key.ctrl && name === "s") return { state, command: state.settingsRow === 0 ? "save_jql_scope" : state.settingsRow === 1 ? "save_team_members" : "save_appearance" };
     if (key.ctrl && name === "r") return { state, command: "reload_preferences" };
-    if (name === "x") return { state: reduce(state, state.settingsRow === 0 ? { type: "scope_restore" } : { type: "appearance_restore" }), command: null };
+    if (name === "x") return { state: reduce(state, state.settingsRow === 0 ? { type: "scope_restore" } : state.settingsRow === 1 ? { type: "team_members_restore" } : { type: "appearance_restore" }), command: null };
     if (name === "up" || name === "k") return { state: reduce(state, { type: "settings_move", delta: -1 }), command: null };
     if (name === "down" || name === "j") return { state: reduce(state, { type: "settings_move", delta: 1 }), command: null };
-    if (name === "space" || key.sequence === " " || name === "enter") return { state: reduce(state, state.settingsRow === 0 ? { type: "scope_edit_start" } : { type: "appearance_cycle" }), command: null };
+    if (name === "space" || key.sequence === " " || name === "enter") {
+      // Team members is always an explicit multiline editor; appearance
+      // rows remain scalar cycles.
+      let action: Action;
+      if (state.settingsRow === 0) action = { type: "scope_edit_start" };
+      else if (state.settingsRow === 1) action = { type: "team_members_edit_start" };
+      else action = { type: "appearance_cycle" };
+      return { state: reduce(state, action), command: null };
+    }
   }
   if (state.section === "updates") {
     const uppercaseM = key.sequence === "M" || key.name === "M" || (name === "m" && key.shift === true);
@@ -160,6 +203,12 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     if (uppercaseM) return updateMutation(state, { type: "request_mark_all_updates" });
     if (name === "r") return { state: reduce(state, { type: "message", message: "Local updates are already current", kind: "info" }), command: null };
     if (name === "enter") return { state: reduce(state, { type: "select_update_issue" }), command: "detail" };
+  }
+  if (state.section === "team") {
+    if (name === "up" || name === "k") return { state: reduce(state, { type: "move_team_selection", delta: -1 }), command: null };
+    if (name === "down" || name === "j") return { state: reduce(state, { type: "move_team_selection", delta: 1 }), command: null };
+    if (name === "r") return { state: reduce(state, { type: "team_refresh_start" }), command: "refresh_team" };
+    if (name === "enter") return { state, command: state.teamSelectedIssueId ? "team_detail" : null };
   }
   if (state.section === "settings" && name === "f") {
     return { state: reduce(state, { type: "confirm_forget_login", value: true }), command: null };
@@ -175,11 +224,16 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
   if (name === "pageup" || (name === "u" && key.ctrl)) return { state: reduce(state, { type: "scroll", delta: -10 }), command: null };
   if (name === "pagedown" || (name === "d" && key.ctrl)) return { state: reduce(state, { type: "scroll", delta: 10 }), command: null };
   if (name === "r") {
+    if (state.section === "team") return { state: reduce(state, { type: "team_refresh_start" }), command: "refresh_team" };
     if (state.section !== "issues") return { state: reduce(state, { type: "message", message: "This section has no remote refresh", kind: "info" }), command: null };
     return { state: reduce(state, { type: "refresh_start" }), command: "refresh" };
   }
   if (name === "l") return { state, command: "lookup" };
-  if (name === "enter") return { state, command: state.focus === "List" ? "detail" : state.focus === "Picker" ? "lookup_submit" : null };
+  if (name === "enter") {
+    if (state.focus === "Picker") return { state, command: "lookup_submit" };
+    if (state.section === "issues" && state.phase === "ready" && state.selectedIssueKey) return { state, command: "detail" };
+    return { state, command: null };
+  }
   if (name === "ctrl-l" || (name === "l" && key.ctrl)) return { state, command: "retry_resize" };
   if (name === "/") return { state: reduce(state, { type: "set_focus", focus: "Search" }), command: "focus_search" };
 

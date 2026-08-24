@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { initialState, MAX_JQL_SCOPE_BYTES, reduce, visibleUpdateGroups } from "../src/state";
+import { initialState, MAX_JQL_SCOPE_BYTES, MAX_TEAM_MEMBER_BYTES, MAX_TEAM_MEMBERS, MAX_TEAM_MEMBERS_BYTES, reduce, visibleUpdateGroups, type RootState } from "../src/state";
 import { parseIssueId, parseIssueKey } from "../src/domain";
 import { applyUpdateSnapshot, emptyUpdateLedger } from "../src/updates/ledger";
 
@@ -194,7 +194,7 @@ describe("root reducer", () => {
     let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "Light", noColor: true, asciiOnly: false, jqlScope: "project = DEV", teamMembers: ["ada", "grace"] } });
     expect(state.activeAppearance).toEqual({ theme: "Light", noColor: true, asciiOnly: false });
     expect(state.teamMemberCount).toBe(2);
-    state = reduce(state, { type: "settings_move", delta: 2 });
+    state = reduce(state, { type: "settings_move", delta: 3 });
     state = reduce(state, { type: "appearance_cycle" });
     expect(state.draftAppearance.noColor).toBe(false);
     expect(state.appearanceDirty).toBe(true);
@@ -208,7 +208,7 @@ describe("root reducer", () => {
   });
   test("clears appearance dirty state when a preview cycles back to active", () => {
     let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "System", noColor: false, asciiOnly: false } });
-    state = reduce(state, { type: "settings_move", delta: 1 });
+    state = reduce(state, { type: "settings_move", delta: 2 });
     state = reduce(state, { type: "appearance_cycle" });
     expect(state.appearanceDirty).toBe(true);
     state = reduce(state, { type: "appearance_cycle" });
@@ -217,7 +217,7 @@ describe("root reducer", () => {
     expect(state.appearanceDirty).toBe(false);
   });
 
-  test("edits the four-row Jira scope editor with Unicode-safe bounds and restore", () => {
+  test("edits the Jira scope editor with Unicode-safe bounds and restore", () => {
     let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "System", noColor: false, asciiOnly: false, jqlScope: "project = DEV" } });
     state = { ...state, phase: "ready", section: "settings", focus: "Settings" };
     expect(state.settingsRow).toBe(0);
@@ -265,6 +265,69 @@ describe("root reducer", () => {
     expect(state.scopeDraft).toBe(attempted);
     expect(state.jqlScope).toBe("project = DEV");
     expect(state.scopeError).toBe("ORDER BY is not allowed");
+  });
+
+  test("isolates Team loading/error/success and preserves stable selection across refreshes", () => {
+    const first = issues[0]!;
+    const second = issues[1]!;
+    let state: RootState = { ...initialState(), phase: "ready" };
+    state = reduce(state, { type: "team_snapshot", snapshot: { issues: [first, second], source: "cache", refreshedAt: "before" }, generation: 0 });
+    state = reduce(state, { type: "select_team_issue", index: 1 });
+    expect(state.teamSelectedIssueId).toBe(second.id);
+    state = reduce(state, { type: "team_refresh_start" });
+    const generation = state.generations.team;
+    expect(state.teamLoading).toBe(true);
+    expect(reduce(state, { type: "team_refresh_error", message: "temporary", generation: generation - 1 })).toBe(state);
+    state = reduce(state, { type: "team_snapshot", snapshot: { issues: [{ ...second, summary: "new" }, first], source: "jira", refreshedAt: "after" }, generation });
+    expect(state.teamLoading).toBe(false);
+    expect(state.teamSelectedIssueId).toBe(second.id);
+    expect(state.teamSelectedIndex).toBe(0);
+    expect(state.teamSource).toBe("jira");
+    expect(state.teamRefreshedAt).toBe("after");
+    expect(reduce(state, { type: "team_snapshot", snapshot: { issues: [], source: "jira", refreshedAt: "stale" }, generation: generation - 1 })).toBe(state);
+  });
+
+  test("Team member editor bounds, attempted retention, cancellation, and atomic success", () => {
+    let state = reduce(initialState(), { type: "preferences_loaded", preferences: { theme: "Dark", noColor: false, asciiOnly: false, teamMembers: ["old"] } });
+    state = reduce(state, { type: "team_members_edit_start" });
+    state = reduce(state, { type: "team_members_edit_insert", value: "new\n" });
+    const attempted = state.teamMembersDraft;
+    state = reduce(state, { type: "team_members_save_start" });
+    const generation = state.generations.teamMembers;
+    expect(reduce(state, { type: "team_members_save_succeeded", generation: generation - 1, preferences: { theme: "Light", noColor: true, asciiOnly: true, teamMembers: ["stale"] }, snapshot: { issues: [], source: "jira", refreshedAt: "stale" } })).toBe(state);
+    state = reduce(state, { type: "team_members_save_failed", generation, message: "could not resolve" });
+    expect(state.teamMembers).toEqual(["old"]);
+    expect(state.teamMembersDraft).toBe(attempted);
+    state = reduce(state, { type: "team_members_save_start" });
+    const cancelledGeneration = state.generations.teamMembers;
+    state = reduce(state, { type: "team_members_save_cancel" });
+    expect(state.teamMembers).toEqual(["old"]);
+    expect(state.teamMembersDraft).toBe(attempted);
+    expect(reduce(state, { type: "team_members_save_succeeded", generation: cancelledGeneration, preferences: { theme: "Light", noColor: true, asciiOnly: true, teamMembers: ["late"] }, snapshot: { issues: [], source: "jira", refreshedAt: "late" } })).toBe(state);
+    state = reduce(state, { type: "team_members_save_start" });
+    const successGeneration = state.generations.teamMembers;
+    state = reduce(state, { type: "team_members_save_succeeded", generation: successGeneration, preferences: { theme: "Light", noColor: true, asciiOnly: true, teamMembers: ["canonical"] }, snapshot: { issues: [issues[2]!], source: "jira", refreshedAt: "success" } });
+    expect(state.teamMembers).toEqual(["canonical"]);
+    expect(state.teamMembersDraft).toBe("canonical");
+    expect(state.teamIssues).toEqual([issues[2]!]);
+    expect(state.teamSource).toBe("jira");
+    expect(state.teamRefreshedAt).toBe("success");
+    expect(state.teamLoading).toBe(false);
+    expect(state.teamError).toBeNull();
+  });
+
+  test("team editor enforces 100 entries, per-entry bytes, and aggregate cap", () => {
+    let state = reduce(initialState(), { type: "team_members_edit_start" });
+    for (let index = 0; index < MAX_TEAM_MEMBERS; index += 1) {
+      state = reduce(state, { type: "team_members_edit_insert", value: `${"x".repeat(MAX_TEAM_MEMBER_BYTES - String(index).length)}${index}` });
+      if (index < MAX_TEAM_MEMBERS - 1) state = reduce(state, { type: "team_members_edit_newline" });
+    }
+    const bounded = state.teamMembersDraft;
+    state = reduce(state, { type: "team_members_edit_newline" });
+    state = reduce(state, { type: "team_members_edit_insert", value: "z" });
+    expect(state.teamMembersDraft).toBe(`${bounded}\n`);
+    expect(new TextEncoder().encode(state.teamMembersDraft).byteLength).toBeLessThanOrEqual(MAX_TEAM_MEMBERS_BYTES);
+    expect(reduce(state, { type: "team_members_edit_insert", value: "a".repeat(MAX_TEAM_MEMBER_BYTES + 1) })).toBe(state);
   });
 
   test("adopts canonical preferences and workspace snapshot only for current scope success", () => {

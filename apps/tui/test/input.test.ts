@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { decodeJqlPaste, handleKey, parseSequence, pasteJqlScope } from "../src/input";
-import { MAX_JQL_SCOPE_BYTES, type RootState } from "../src/state";
+import { decodeJqlPaste, decodeTeamMembersPaste, handleKey, parseSequence, pasteJqlScope, pasteTeamMembers } from "../src/input";
+import { MAX_JQL_SCOPE_BYTES, MAX_TEAM_MEMBER_BYTES, MAX_TEAM_MEMBERS, MAX_TEAM_MEMBERS_BYTES, type RootState } from "../src/state";
 import { initialState, reduce } from "../src/state";
 import type { IssueSummary } from "../src/domain";
 import { applyUpdateSnapshot, emptyUpdateLedger, type UpdateLedger } from "../src/updates/ledger";
@@ -221,22 +221,23 @@ describe("key handling", () => {
     expect(state.filteredIssues).toHaveLength(1);
     expect(state.updates.readIssueIds).toEqual([issue.id]);
   });
-  test("routes appearance controls without Jira refreshes", () => {
+  test("routes five settings rows and team editor controls", () => {
     let state: RootState = { ...initialState(), phase: "ready", section: "settings", focus: "Settings" };
     let result = handleKey(state, { name: "down", sequence: "\u001b[B" });
     expect(result.state.settingsRow).toBe(1);
     result = handleKey(result.state, { name: "space", sequence: " " });
-    expect(result.state.appearanceDirty).toBe(true);
+    expect(result.state.teamMembersEditing).toBe(true);
+    result = handleKey(result.state, { name: "escape", sequence: "\u001b" });
     result = handleKey(result.state, { name: "s", sequence: "\u0013", ctrl: true });
-    expect(result.command).toBe("save_appearance");
+    expect(result.command).toBe("save_team_members");
     result = handleKey(result.state, { name: "r", sequence: "\u0012", ctrl: true });
     expect(result.command).toBe("reload_preferences");
     expect(handleKey(result.state, { name: "r", sequence: "r" }).command).toBeNull();
     result = handleKey(result.state, { name: "x", sequence: "x" });
-    expect(result.state.appearanceDirty).toBe(false);
+    expect(result.state.teamMembersDraft).toBe("");
   });
 
-  test("routes four settings rows and opens the scope editor explicitly", () => {
+  test("routes scope plus Theme/No color/ASCII rows explicitly", () => {
     let state: RootState = { ...initialState(), phase: "ready", section: "settings", focus: "Settings" };
     state = handleKey(state, { name: "enter", sequence: "\r" }).state;
     expect(state.scopeEditing).toBe(true);
@@ -251,6 +252,10 @@ describe("key handling", () => {
 
     state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
     expect(state.settingsRow).toBe(1);
+    state = handleKey(state, { name: "enter", sequence: "\r" }).state;
+    expect(state.teamMembersEditing).toBe(true);
+    state = handleKey(state, { name: "escape", sequence: "\u001b" }).state;
+    state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
     state = handleKey(state, { name: "space", sequence: " " }).state;
     expect(state.draftAppearance.theme).toBe("Light");
     state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
@@ -282,5 +287,58 @@ describe("key handling", () => {
     expect(cancelled.command).toBe("cancel_scope_save");
     expect(cancelled.state.scopeSaving).toBe(false);
     expect(cancelled.state.generations.scope).toBe(generation + 1);
+  });
+
+  test("primary Issues selection from Nav moves focus and Enter opens detail", () => {
+    const issue = { id: "1" as never, key: "ABC-1" as never, summary: "Primary", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "now" };
+    let state = reduce(initialState(), workspaceSnapshot([issue]));
+    expect(state.focus).toBe("Nav");
+    state = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
+    expect(state.focus).toBe("List");
+    const opened = handleKey(state, { name: "return", sequence: "\r" });
+    expect(opened.command).toBe("detail");
+    state = reduce(opened.state, { type: "detail_start", issueKey: "ABC-1" });
+    const generation = state.generations.detail;
+    expect(state.detailIssueKey).toBe("ABC-1");
+    state = reduce(state, { type: "detail_result", issueKey: "ABC-1", generation, issue: { issue, issueType: "Task", reporter: "Ada", project: "ABC", parent: null, labels: [], dueDate: null, created: "now", description: "detail", comments: [], attachments: [], remote: false } });
+    expect(state.detail?.description).toBe("detail");
+  });
+
+  test("Team Enter emits dedicated remote-detail command without primary membership mutation", () => {
+    const teamIssue = { id: "team-1" as never, key: "TEAM-9" as never, summary: "Team issue", status: "Open", statusCategory: "to_do" as const, priority: "High", assignee: "Ada", updated: "now" };
+    const primary = { id: "primary-1" as never, key: "ABC-1" as never, summary: "Primary", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "now" };
+    let state = reduce(initialState(), workspaceSnapshot([primary]));
+    state = reduce(state, { type: "team_snapshot", snapshot: { issues: [teamIssue], source: "jira", refreshedAt: "now" }, generation: state.generations.team });
+    state = reduce(state, { type: "set_section", section: "team" });
+    const result = handleKey(state, { name: "enter", sequence: "\r" });
+    expect(result.command).toBe("team_detail");
+    const started = reduce(result.state, { type: "team_detail_start", issueKey: "TEAM-9" });
+    expect(started.focus).toBe("Detail");
+    expect(started.selectedIssueKey).toBe("ABC-1");
+    expect(started.issues).toEqual([primary]);
+    const generation = started.generations.detail;
+    const detail = { issue: teamIssue, issueType: "Task", reporter: "Ada", project: "TEAM", parent: null, labels: [], dueDate: null, created: "now", description: "remote", comments: [], attachments: [], remote: true };
+    expect(reduce(started, { type: "detail_result", issueKey: "TEAM-9", generation, issue: detail }).detail?.remote).toBe(true);
+  });
+
+  test("Team multiline typing, CRLF/UTF-8/control paste, and atomic bounds", () => {
+    let state: RootState = { ...initialState(), phase: "ready", section: "settings", focus: "Settings", settingsRow: 1 };
+    state = handleKey(state, { name: "space", sequence: " " }).state;
+    state = handleKey(state, { name: "a", sequence: "a" }).state;
+    state = handleKey(state, { name: "enter", sequence: "\r" }).state;
+    state = handleKey(state, { name: "b", sequence: "b" }).state;
+    expect(state.teamMembersDraft).toBe("a\nb");
+    state = handleKey(state, { name: "backspace", sequence: "\u007f" }).state;
+    expect(state.teamMembersDraft).toBe("a\n");
+    const encoded = new TextEncoder();
+    expect(decodeTeamMembersPaste(encoded.encode("grace\r\nada"))).toBe("grace\nada");
+    expect(decodeTeamMembersPaste(Uint8Array.from([0xc3, 0x28]))).toBeNull();
+    expect(decodeTeamMembersPaste(Uint8Array.from([0x61, 0x09]))).toBeNull();
+    expect(pasteTeamMembers("a", encoded.encode("\rbad"))).toBeNull();
+    expect(pasteTeamMembers("a", encoded.encode("é"))).toBe("é");
+    expect(new TextEncoder().encode("x".repeat(MAX_TEAM_MEMBER_BYTES + 1)).byteLength).toBeGreaterThan(MAX_TEAM_MEMBER_BYTES);
+    const many = Array.from({ length: MAX_TEAM_MEMBERS }, (_, index) => `m${index}`).join("\n");
+    expect(new TextEncoder().encode(many).byteLength).toBeLessThanOrEqual(MAX_TEAM_MEMBERS_BYTES);
+    expect(pasteTeamMembers(many, encoded.encode("\nextra"))).toBe("\nextra");
   });
 });

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { parseIssueId, parseIssueKey, type IssueDetail, type IssueSummary } from "../src/domain";
 import { paletteFor, renderApp } from "../src/render/app";
-import { initialState, reduce, visibleUpdateGroups } from "../src/state";
+import { initialState, reduce, visibleUpdateGroups, type RootState } from "../src/state";
 import { applyUpdateSnapshot, emptyUpdateLedger } from "../src/updates/ledger";
 
 const longKey = parseIssueKey("EXTRAORDINARILY_LONG_PROJECT_KEY-123456789");
@@ -66,7 +66,7 @@ describe("OpenTUI frames", () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {
       let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
-      state = reduce(state, { type: "settings_move", delta: 3 });
+      state = reduce(state, { type: "settings_move", delta: 4 });
       state = reduce(state, { type: "appearance_cycle" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -86,7 +86,7 @@ describe("OpenTUI frames", () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {
       let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
-      state = reduce(state, { type: "settings_move", delta: 2 });
+      state = reduce(state, { type: "settings_move", delta: 3 });
       state = reduce(state, { type: "appearance_cycle" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -100,6 +100,7 @@ describe("OpenTUI frames", () => {
   test("preserves the complete issue key and row metadata at every supported width", async () => {
     for (const width of [60, 79, 80, 119, 120, 160]) {
       const frame = await frameAt(width, 24);
+      expect(frame).not.toContain("█");
       // Narrow cards wrap the key across terminal rows; no characters may be
       // dropped or replaced with an ellipsis.
       const completeKey = frame.includes(longKey)
@@ -229,7 +230,7 @@ describe("OpenTUI frames", () => {
       const newIssue = { ...changed, id: parseIssueId("10002"), key: parseIssueKey("OTHER-987654321"), summary: "New “user” issue → intact · text •", updated: "2026-08-24T02:00:00Z" };
       state = reduce(state, workspaceSnapshot([changed, newIssue], { source: "jira", refreshedAt: "later-2", updates: applyUpdateSnapshot(state.updates, [changed], [changed, newIssue]), updatesBaselineEstablished: true }));
       state = reduce(state, { type: "set_section", section: "updates" });
-      state = reduce(state, { type: "settings_move", delta: 3 });
+      state = reduce(state, { type: "settings_move", delta: 4 });
       state = reduce(state, { type: "appearance_cycle" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -275,5 +276,43 @@ describe("OpenTUI frames", () => {
     } finally {
       setup.renderer.destroy();
     }
+  });
+
+  test("renders the primary detail regression after Nav selection and complete detail surface", async () => {
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
+      state = reduce(state, { type: "move_selection", delta: 0 });
+      state = reduce(state, { type: "detail_start", issueKey: longKey });
+      state = reduce(state, { type: "detail_result", issueKey: longKey, generation: state.generations.detail, issue: detail });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("DESCRIPTION");
+      expect(frame).toContain("A safely projected Jira description.");
+    } finally { setup.renderer.destroy(); }
+  });
+
+  test("renders Team empty/loading/error/success states, long keys, and raw Unicode in ASCII mode", async () => {
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      let state: RootState = { ...initialState({ width: 120, height: 40 }), phase: "ready", section: "team", focus: "List" };
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("No team issues yet");
+      state = reduce(state, { type: "team_refresh_start" });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Loading Team issues");
+      state = reduce(state, { type: "team_refresh_error", message: "bounded error", generation: state.generations.team });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("bounded error");
+      const teamIssue = { ...issue, id: parseIssueId("team-1"), key: parseIssueKey("TEAM-123456789"), summary: "用户 “quote” → detail", assignee: "Élodie" };
+      state = reduce(state, { type: "team_snapshot", snapshot: { issues: [teamIssue], source: "jira", refreshedAt: "later" }, generation: state.generations.team });
+      state = reduce(state, { type: "preferences_loaded", preferences: { theme: "Dark", noColor: false, asciiOnly: true, teamMembers: ["account"] } });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("TEAM-123456789");
+      expect(frame).toContain("用户 “quote” → detail");
+      expect(frame).not.toMatch(/[▸…·]/u);
+    } finally { setup.renderer.destroy(); }
   });
 });

@@ -17,6 +17,16 @@ export type SettingsPreferences = AppearancePreferences & Readonly<{
   jqlScope?: string;
   teamMembers?: readonly string[];
 }>;
+export const MAX_TEAM_MEMBERS = 100;
+export const MAX_TEAM_MEMBER_BYTES = 320;
+/** A deliberately bounded editor buffer; the storage layer remains authoritative. */
+/** 100 identifiers at 320 bytes each plus one LF separator per boundary. */
+export const MAX_TEAM_MEMBERS_BYTES = MAX_TEAM_MEMBERS * MAX_TEAM_MEMBER_BYTES + MAX_TEAM_MEMBERS;
+export type TeamSnapshot = Readonly<{
+  issues: readonly IssueSummary[];
+  source: "cache" | "jira" | "local";
+  refreshedAt: string;
+}>;
 export type Phase = "onboarding" | "loading" | "ready" | "error";
 export type PickerMode = "lookup" | "status" | null;
 
@@ -44,7 +54,7 @@ export type RootState = {
   detectedTheme: "Light" | "Dark" | null;
   activeAppearance: AppearancePreferences;
   draftAppearance: AppearancePreferences;
-  /** Settings row: 0 scope, 1 theme, 2 no-color, 3 ASCII-only. */
+  /** Settings row: 0 scope, 1 Team members, 2 theme, 3 no-color, 4 ASCII-only. */
   settingsRow: number;
   appearanceDirty: boolean;
   jqlScope: string | null;
@@ -53,6 +63,11 @@ export type RootState = {
   scopeSaving: boolean;
   scopeError: string | null;
   teamMemberCount: number;
+  teamMembers: string[];
+  teamMembersDraft: string;
+  teamMembersEditing: boolean;
+  teamMembersSaving: boolean;
+  teamMembersError: string | null;
   siteLabel: string | null;
   identity: string | null;
   onboarding: Onboarding;
@@ -66,19 +81,28 @@ export type RootState = {
   lookupEditor: string;
   selectedIndex: number;
   selectedIssueKey: string | null;
+  /** Detail key is separate so a Team issue never enters primary membership. */
+  detailIssueKey: string | null;
   detail: IssueDetail | null;
   detailLoading: boolean;
   detailError: string | null;
   refreshLoading: boolean;
   lastSource: "cache" | "jira" | null;
   lastRefresh: string | null;
+  teamIssues: IssueSummary[];
+  teamSelectedIndex: number;
+  teamSelectedIssueId: IssueId | null;
+  teamLoading: boolean;
+  teamError: string | null;
+  teamSource: TeamSnapshot["source"] | null;
+  teamRefreshedAt: string | null;
   updates: UpdateLedger;
   updatesBaselineEstablished: boolean;
   updateFilter: UpdateFilter;
   selectedUpdateIndex: number;
   selectedUpdateIssueId: IssueId | null;
   confirmMarkAllUpdates: boolean;
-  generations: { connect: number; refresh: number; detail: number; lookup: number; scope: number };
+  generations: { connect: number; refresh: number; detail: number; lookup: number; scope: number; team: number; teamMembers: number };
   overlays: { help: boolean; eventLog: boolean };
   confirmForgetLogin: boolean;
   scroll: { list: number; detail: number; updates: number; team: number; eventLog: number };
@@ -96,12 +120,14 @@ export function initialState(size: TerminalSize = { width: 120, height: 40 }): R
     activeAppearance: { theme: "System", noColor: false, asciiOnly: false },
     draftAppearance: { theme: "System", noColor: false, asciiOnly: false },
     settingsRow: 0, appearanceDirty: false, jqlScope: null, scopeDraft: "", scopeEditing: false, scopeSaving: false, scopeError: null, teamMemberCount: 0,
+    teamMembers: [], teamMembersDraft: "", teamMembersEditing: false, teamMembersSaving: false, teamMembersError: null,
     siteLabel: null, identity: null,
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
-    issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
+    issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null, detailIssueKey: null,
     detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
+    teamIssues: [], teamSelectedIndex: 0, teamSelectedIssueId: null, teamLoading: false, teamError: null, teamSource: null, teamRefreshedAt: null,
     updates: emptyUpdateLedger(), updatesBaselineEstablished: false, updateFilter: "unread", selectedUpdateIndex: 0, selectedUpdateIssueId: null, confirmMarkAllUpdates: false,
-    generations: { connect: 0, refresh: 0, detail: 0, lookup: 0, scope: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
+    generations: { connect: 0, refresh: 0, detail: 0, lookup: 0, scope: 0, team: 0, teamMembers: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
     scroll: { list: 0, detail: 0, updates: 0, team: 0, eventLog: 0 }, events: [], lastMessage: null,
   };
 }
@@ -117,6 +143,17 @@ export type Action =
   | { type: "appearance_save_failed"; message?: string }
   | { type: "appearance_reload_failed"; message?: string }
   | { type: "appearance_restore" }
+  | { type: "team_members_edit_start" }
+  | { type: "team_members_edit_cancel" }
+  | { type: "team_members_edit_insert"; value: string }
+  | { type: "team_members_edit_newline" }
+  | { type: "team_members_edit_backspace" }
+  | { type: "team_members_restore" }
+  | { type: "team_members_save_start" }
+  | { type: "team_members_save_cancel" }
+  | { type: "team_members_validation_error"; message: string }
+  | { type: "team_members_save_succeeded"; preferences: SettingsPreferences; snapshot: TeamSnapshot; generation: number }
+  | { type: "team_members_save_failed"; message: string; generation: number }
   | { type: "scope_edit_start" }
   | { type: "scope_edit_cancel" }
   | { type: "scope_edit_insert"; value: string }
@@ -140,11 +177,16 @@ export type Action =
   | { type: "onboarding_error"; message: string; generation?: number }
   | { type: "authenticated"; siteLabel: string; identity: string; generation?: number }
   | { type: "workspace_snapshot"; siteLabel: string; identity: string; issues: readonly IssueSummary[]; source: "cache" | "jira"; refreshedAt: string; generation: number; updates: UpdateLedger; updatesBaselineEstablished: boolean }
+  | { type: "team_snapshot"; snapshot: TeamSnapshot; generation: number }
+  | { type: "team_refresh_start" }
+  | { type: "team_refresh_cancel" }
+  | { type: "team_refresh_error"; message: string; generation: number }
   | { type: "updates_persisted"; updates: UpdateLedger }
   | { type: "refresh_start" }
   | { type: "refresh_cancel" }
   | { type: "refresh_error"; message: string; generation: number }
-  | { type: "detail_start"; issueKey: string }
+  | { type: "detail_start"; issueKey: string; origin?: "primary" | "team" | "lookup" }
+  | { type: "team_detail_start"; issueKey: string }
   | { type: "detail_cancel" }
   | { type: "detail_result"; issue: IssueDetail; issueKey: string; generation: number }
   | { type: "detail_error"; message: string; generation: number }
@@ -157,6 +199,8 @@ export type Action =
   | { type: "set_lookup"; value: string }
   | { type: "confirm_forget_login"; value: boolean }
   | { type: "move_selection"; delta: number }
+  | { type: "move_team_selection"; delta: number }
+  | { type: "select_team_issue"; index: number }
   | { type: "select_issue"; index: number }
   | { type: "toggle_update_filter" }
   | { type: "move_update_selection"; delta: number }
@@ -197,8 +241,39 @@ function validScopeEdit(current: string, value: string): boolean {
   return value.length > 0 && !hasControlCharacter(value) && utf8Bytes(current + value) <= MAX_JQL_SCOPE_BYTES;
 }
 
+function teamMemberLines(value: string): string[] {
+  return value.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+}
+
+export function teamMemberIdentifiers(value: string): string[] | null {
+  const lines = teamMemberLines(value);
+  if (lines.length > MAX_TEAM_MEMBERS) return null;
+  const seen = new Set<string>();
+  const result: string[] = [];
+  let aggregate = 0;
+  for (const line of lines) {
+    if (hasControlCharacter(line) || utf8Bytes(line) > MAX_TEAM_MEMBER_BYTES) return null;
+    aggregate += utf8Bytes(line) + 1;
+    if (aggregate > MAX_TEAM_MEMBERS_BYTES) return null;
+    if (!seen.has(line)) { seen.add(line); result.push(line); }
+  }
+  return result;
+}
+
+function selectTeam(state: RootState, issues: readonly IssueSummary[]): RootState {
+  const oldId = state.teamSelectedIssueId;
+  const preserved = oldId === null ? -1 : issues.findIndex((issue) => String(issue.id) === String(oldId));
+  const index = preserved >= 0 ? preserved : clampIndex(state.teamSelectedIndex, issues.length);
+  return { ...state, teamIssues: [...issues], teamSelectedIndex: index, teamSelectedIssueId: issues[index]?.id ?? null, scroll: { ...state.scroll, team: Math.max(0, index - 5) } };
+}
+
+function applyTeamPreferences(state: RootState, preferences: SettingsPreferences): RootState {
+  const members = [...(preferences.teamMembers ?? [])];
+  return { ...state, teamMembers: members, teamMemberCount: members.length, teamMembersDraft: state.teamMembersEditing || state.teamMembersSaving ? state.teamMembersDraft : members.join("\n") };
+}
+
 function withSettingsRow(state: RootState, row: number): RootState {
-  const next = clampIndex(row, 4);
+  const next = clampIndex(row, 5);
   return { ...state, settingsRow: next };
 }
 
@@ -242,6 +317,7 @@ function selectedIssue(state: RootState, filtered: readonly IssueSummary[]): Roo
     detail: null,
     detailLoading: false,
     detailError: null,
+    detailIssueKey: null,
     generations: hasDetailOperation ? { ...state.generations, detail: state.generations.detail + 1 } : state.generations,
   };
 }
@@ -279,18 +355,21 @@ export function reduce(state: RootState, action: Action): RootState {
         scopeDraft: state.scopeEditing || state.scopeSaving ? state.scopeDraft : activeScope,
         scopeError: null,
         teamMemberCount: action.preferences.teamMembers?.length ?? 0,
+        teamMembers: [...(action.preferences.teamMembers ?? [])],
+        teamMembersDraft: state.teamMembersEditing || state.teamMembersSaving ? state.teamMembersDraft : [...(action.preferences.teamMembers ?? [])].join("\n"),
       };
     }
-    case "settings_move": return state.scopeSaving ? state : withSettingsRow(state, state.settingsRow + action.delta);
+    case "settings_move": return state.scopeSaving || state.teamMembersSaving || state.teamMembersEditing ? state : withSettingsRow(state, state.settingsRow + action.delta);
     case "appearance_cycle": {
-      if (state.scopeSaving || state.scopeEditing || state.settingsRow === 0) return state;
+      if (state.scopeSaving || state.scopeEditing || state.teamMembersSaving || state.teamMembersEditing || state.settingsRow === 0) return state;
       const row = state.settingsRow;
-      if (row === 1) {
+      if (row === 1) return state;
+      if (row === 2) {
         const modes: ThemeMode[] = ["System", "Light", "Dark"];
         const index = Math.max(0, modes.indexOf(state.draftAppearance.theme));
         return withAppearance(state, { ...state.draftAppearance, theme: modes[(index + 1) % modes.length] ?? "System" });
       }
-      if (row === 2) return withAppearance(state, { ...state.draftAppearance, noColor: !state.draftAppearance.noColor });
+      if (row === 3) return withAppearance(state, { ...state.draftAppearance, noColor: !state.draftAppearance.noColor });
       return withAppearance(state, { ...state.draftAppearance, asciiOnly: !state.draftAppearance.asciiOnly });
     }
     case "appearance_saved": {
@@ -305,11 +384,48 @@ export function reduce(state: RootState, action: Action): RootState {
         scopeDraft: state.scopeEditing || state.scopeSaving ? state.scopeDraft : scopeValue(action.preferences.jqlScope ?? ""),
         scopeError: null,
         teamMemberCount: action.preferences.teamMembers?.length ?? 0,
+        teamMembers: [...(action.preferences.teamMembers ?? [])],
+        teamMembersDraft: state.teamMembersEditing || state.teamMembersSaving ? state.teamMembersDraft : [...(action.preferences.teamMembers ?? [])].join("\n"),
       };
     }
     case "appearance_save_failed": return withEvent(state, "settings", action.message ?? "Appearance could not be saved; changes remain local");
     case "appearance_reload_failed": return withEvent(state, "settings", action.message ?? "Preferences could not be reloaded; changes remain local");
     case "appearance_restore": return state.settingsRow === 0 ? state : withAppearance(state, state.activeAppearance);
+    case "team_members_edit_start":
+      return state.scopeSaving || state.teamMembersSaving ? state : { ...state, settingsRow: 1, teamMembersEditing: true, teamMembersError: null, teamMembersDraft: state.teamMembers.join("\n") };
+    case "team_members_edit_cancel":
+      return state.teamMembersSaving ? state : { ...state, teamMembersEditing: false, teamMembersError: null };
+    case "team_members_edit_insert": {
+      if (!state.teamMembersEditing || state.teamMembersSaving) return state;
+      const next = state.teamMembersDraft + action.value;
+      return teamMemberIdentifiers(next) !== null ? { ...state, teamMembersDraft: next, teamMembersError: null } : state;
+    }
+    case "team_members_edit_newline": {
+      if (!state.teamMembersEditing || state.teamMembersSaving) return state;
+      const next = `${state.teamMembersDraft}\n`;
+      // An unfinished empty line is allowed while editing; bounds are checked
+      // again when a non-empty identifier is entered or save is requested.
+      if (utf8Bytes(next) > MAX_TEAM_MEMBERS_BYTES) return state;
+      return { ...state, teamMembersDraft: next, teamMembersError: null };
+    }
+    case "team_members_edit_backspace": {
+      if (!state.teamMembersEditing || state.teamMembersSaving || state.teamMembersDraft.length === 0) return state;
+      const chars = Array.from(state.teamMembersDraft); chars.pop();
+      return { ...state, teamMembersDraft: chars.join(""), teamMembersError: null };
+    }
+    case "team_members_restore": return state.teamMembersSaving ? state : { ...state, teamMembersDraft: state.teamMembers.join("\n"), teamMembersError: null };
+    case "team_members_save_start":
+      return state.teamMembersSaving ? state : { ...state, teamMembersEditing: true, teamMembersSaving: true, teamMembersError: null, generations: { ...state.generations, teamMembers: state.generations.teamMembers + 1 } };
+    case "team_members_save_cancel":
+      return state.teamMembersSaving ? withEvent({ ...state, teamMembersSaving: false, teamMembersEditing: true, generations: { ...state.generations, teamMembers: state.generations.teamMembers + 1 } }, "settings", "Team members save cancelled") : state;
+    case "team_members_validation_error": return { ...state, teamMembersError: action.message.slice(0, 240) };
+    case "team_members_save_succeeded": {
+      if (!state.teamMembersSaving || action.generation !== state.generations.teamMembers) return state;
+      const next = applyTeamPreferences({ ...state, teamMembersSaving: false, teamMembersEditing: false, teamMembersError: null, teamLoading: false, teamError: null, teamSource: action.snapshot.source, teamRefreshedAt: action.snapshot.refreshedAt }, action.preferences);
+      return withEvent(selectTeam(next, action.snapshot.issues), "settings", "Team members saved");
+    }
+    case "team_members_save_failed":
+      return !state.teamMembersSaving || action.generation !== state.generations.teamMembers ? state : withEvent({ ...state, teamMembersSaving: false, teamMembersEditing: true, teamMembersError: action.message.slice(0, 240) }, "settings", action.message.slice(0, 240));
     case "scope_edit_start":
       return state.scopeSaving ? state : { ...state, settingsRow: 0, scopeEditing: true, scopeError: null, scopeDraft: state.jqlScope ?? "" };
     case "scope_edit_cancel": return state.scopeSaving ? state : { ...state, scopeEditing: false, scopeError: null };
@@ -346,6 +462,8 @@ export function reduce(state: RootState, action: Action): RootState {
         scopeSaving: false,
         scopeError: null,
         teamMemberCount: action.preferences.teamMembers?.length ?? 0,
+        teamMembers: [...(action.preferences.teamMembers ?? [])],
+        teamMembersDraft: [...(action.preferences.teamMembers ?? [])].join("\n"),
       }, {
         type: "workspace_snapshot",
         siteLabel: action.snapshot.siteLabel,
@@ -364,7 +482,7 @@ export function reduce(state: RootState, action: Action): RootState {
         ? state
         : withEvent({ ...state, scopeSaving: false, scopeEditing: true, scopeError: action.message.slice(0, 240) }, "settings", action.message.slice(0, 240));
     case "set_focus": return { ...state, focus: action.focus };
-    case "set_section": return { ...state, section: action.section, focus: action.section === "issues" || action.section === "updates" ? "List" : action.section === "settings" ? "Settings" : "Nav" };
+    case "set_section": return { ...state, section: action.section, focus: action.section === "issues" || action.section === "updates" || action.section === "team" ? "List" : "Settings" };
     case "onboarding_text": {
       const field = state.onboarding.field;
       if (field === "token" || field === "remember") return state;
@@ -393,18 +511,20 @@ export function reduce(state: RootState, action: Action): RootState {
         filteredIssues: [],
         selectedIndex: 0,
         selectedIssueKey: null,
+        detailIssueKey: null,
         detail: null,
         detailLoading: false,
         detailError: null,
         lastSource: null,
         lastRefresh: null,
+        teamIssues: [], teamSelectedIndex: 0, teamSelectedIssueId: null, teamLoading: false, teamError: null, teamSource: null, teamRefreshedAt: null,
         updates: emptyUpdateLedger(),
         updatesBaselineEstablished: false,
         selectedUpdateIndex: 0,
         selectedUpdateIssueId: null,
         confirmMarkAllUpdates: false,
         onboarding: { ...state.onboarding, token: emptySecret(), submitting: false, error: null },
-        generations: { ...state.generations, refresh: state.generations.refresh + 1, detail: state.generations.detail + 1 },
+        generations: { ...state.generations, refresh: state.generations.refresh + 1, detail: state.generations.detail + 1, team: state.generations.team + 1, teamMembers: state.generations.teamMembers + 1 },
       }, "auth", "Authenticated");
     }
     case "workspace_snapshot": {
@@ -413,13 +533,22 @@ export function reduce(state: RootState, action: Action): RootState {
       const next = { ...state, phase: "ready" as const, siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt, updates: action.updates, updatesBaselineEstablished: action.updatesBaselineEstablished, confirmMarkAllUpdates: false };
       return withEvent(selectedUpdate(selectedIssue(next, filtered), visibleUpdateGroups(next)), "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
     }
+    case "team_snapshot": {
+      if (action.generation !== state.generations.team) return state;
+      const snapshot = action.snapshot;
+      return withEvent({ ...selectTeam(state, snapshot.issues), teamLoading: false, teamError: null, teamSource: snapshot.source, teamRefreshedAt: snapshot.refreshedAt }, "team", `Loaded ${snapshot.issues.length} team issues from ${snapshot.source}`);
+    }
+    case "team_refresh_start": return state.teamLoading ? state : { ...state, teamLoading: true, teamError: null, generations: { ...state.generations, team: state.generations.team + 1 } };
+    case "team_refresh_cancel": return { ...state, teamLoading: false, generations: { ...state.generations, team: state.generations.team + 1 } };
+    case "team_refresh_error": return action.generation === state.generations.team ? withEvent({ ...state, teamLoading: false, teamError: action.message.slice(0, 240) }, "team", action.message.slice(0, 240)) : state;
     case "updates_persisted": return { ...state, updates: action.updates };
     case "refresh_start": return { ...state, refreshLoading: true, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_cancel": return { ...state, refreshLoading: false, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_error": return action.generation === state.generations.refresh ? withEvent({ ...state, refreshLoading: false }, "refresh", action.message) : state;
-    case "detail_start": return { ...state, detailLoading: true, detailError: null, selectedIssueKey: action.issueKey, detail: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
-    case "detail_cancel": return { ...state, detailLoading: false, detail: null, detailError: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
-    case "detail_result": return action.generation === state.generations.detail && action.issueKey === state.selectedIssueKey ? { ...state, detailLoading: false, detail: action.issue, detailError: null, scroll: { ...state.scroll, detail: 0 } } : state;
+    case "detail_start": return { ...state, detailLoading: true, detailError: null, selectedIssueKey: action.origin === "team" ? state.selectedIssueKey : action.issueKey, detailIssueKey: action.issueKey, detail: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "team_detail_start": return { ...state, detailLoading: true, detailError: null, detailIssueKey: action.issueKey, detail: null, focus: "Detail", generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "detail_cancel": return { ...state, detailLoading: false, detail: null, detailError: null, detailIssueKey: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "detail_result": return action.generation === state.generations.detail && action.issueKey === state.detailIssueKey ? { ...state, detailLoading: false, detail: action.issue, detailError: null, scroll: { ...state.scroll, detail: 0 } } : state;
     case "detail_error": return action.generation === state.generations.detail ? withEvent({ ...state, detailLoading: false, detailError: action.message }, "detail", action.message) : state;
     case "set_search": {
       const filtered = filterIssues(state.issues, action.value, state.statusFilter);
@@ -447,7 +576,16 @@ export function reduce(state: RootState, action: Action): RootState {
     case "move_selection": {
       if (!state.filteredIssues.length) return state;
       const index = clampIndex(state.selectedIndex + action.delta, state.filteredIssues.length);
-      return { ...state, selectedIndex: index, selectedIssueKey: state.filteredIssues[index]?.key ?? null, scroll: { ...state.scroll, list: Math.max(0, index - 5) } };
+      return { ...state, selectedIndex: index, selectedIssueKey: state.filteredIssues[index]?.key ?? null, focus: "List", scroll: { ...state.scroll, list: Math.max(0, index - 5) } };
+    }
+    case "move_team_selection": {
+      if (!state.teamIssues.length || state.teamLoading || state.teamMembersSaving) return state;
+      const index = clampIndex(state.teamSelectedIndex + action.delta, state.teamIssues.length);
+      return { ...state, teamSelectedIndex: index, teamSelectedIssueId: state.teamIssues[index]?.id ?? null, scroll: { ...state.scroll, team: Math.max(0, index - 5) } };
+    }
+    case "select_team_issue": {
+      const index = clampIndex(action.index, state.teamIssues.length);
+      return { ...state, teamSelectedIndex: index, teamSelectedIssueId: state.teamIssues[index]?.id ?? null };
     }
     case "select_issue": {
       const index = clampIndex(action.index, state.filteredIssues.length);
@@ -502,7 +640,7 @@ export function reduce(state: RootState, action: Action): RootState {
     case "toggle_help": return { ...state, overlays: { ...state.overlays, help: !state.overlays.help }, focus: state.overlays.help ? "List" : "Help" };
     case "toggle_event_log": return { ...state, overlays: { ...state.overlays, eventLog: !state.overlays.eventLog }, focus: state.overlays.eventLog ? "List" : "EventLog" };
     case "scroll": {
-      const key = state.focus === "Detail" ? "detail" : state.overlays.eventLog ? "eventLog" : state.section === "updates" ? "updates" : "list";
+      const key = state.focus === "Detail" ? "detail" : state.overlays.eventLog ? "eventLog" : state.section === "updates" ? "updates" : state.section === "team" ? "team" : "list";
       return { ...state, scroll: { ...state.scroll, [key]: Math.max(0, state.scroll[key] + action.delta) } };
     }
     case "message": return withEvent(state, action.kind ?? "info", action.message);
