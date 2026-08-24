@@ -31,7 +31,9 @@ bun start
 
 The default view is `(assignee = currentUser() OR watcher = currentUser())`, ordered by newest
 update. In Issues, use `/` for local search, `s` for the local status filter, `l` for exact-key
-lookup, `Enter` for detail, `r` to refresh, `?` for help, and `q` to quit.
+lookup, `Enter` for detail, `r` to refresh, `?` for help, and `q` to quit. Moving the selection with
+arrows or `j`/`k` focuses the issue list; native scrollbar chrome stays hidden while keyboard
+scrolling remains available.
 
 Press `2` for Updates. Its `u` (Unread/All), `m` (toggle read), `M` (mark displayed read),
 `Space`/`o` (expand), and `r` (local status message) controls do not contact Jira. Updates are
@@ -52,7 +54,18 @@ Appearance controls are local previews until explicitly saved: use `j`/`k` (or a
 `Theme`, `No color`, or `ASCII-only`, then press `Space` or `Enter` to preview a change. Press
 `Ctrl-s` to atomically save the draft, `Ctrl-r` to reload saved preferences, or `x` to restore the
 active value. `System` follows the detected terminal theme and falls back to Dark when detection is
-unavailable. Team member configuration is currently shown as a read-only summary.
+unavailable.
+
+To configure the Team tracker, select `Team members` in Settings and press `Space` or `Enter`. Enter
+one Jira account ID or Atlassian email per line, then press `Ctrl-s`. Jira Desk resolves emails to
+canonical account IDs and activates the new Team cache only after the candidate query and local
+preference save succeed. `Esc` closes the editor or cancels an in-flight save, and `x` restores the
+active member list. Up to 100 entries of 320 UTF-8 bytes each are accepted.
+
+Press `3` for Team. It shows in-progress issues assigned to configured Team members, ordered by
+newest update. Use arrows or `j`/`k` to select, `r` to refresh, and `Enter` to open remote read-only
+detail. Team membership, cache data, loading state, and selection are isolated from the primary
+Issues workspace; an empty Team remains local and makes no Jira request.
 
 Credentials never enter argv, renderer snapshots, diagnostics, or cache files. The custom token
 editor is masked and clears its buffer immediately after a connection attempt. On macOS and Linux,
