@@ -2,8 +2,8 @@ import { discoverCloudId, JiraHttpClient, JiraHttpConfig } from "../jira";
 import { isJiraError, type JiraError, type JiraErrorCategory } from "../jira/errors";
 import { IssueCache } from "../storage/cache";
 import { SystemCredentialStore, type CredentialParts } from "../storage/credentials";
-import { PreferencesStore, PreferencesError, type Preferences } from "../storage/preferences";
-import { Workspace, WorkspaceError, type WorkspaceSnapshot } from "./workspace";
+import { PreferencesStore, PreferencesError, type Preferences, validatePreferences } from "../storage/preferences";
+import { Workspace, WorkspaceError, type WorkspaceScopeCandidate, type WorkspaceSnapshot } from "./workspace";
 import type { JiraReadPort } from "./ports";
 import type { IssueDetail, IssueSummary } from "../domain";
 import type { UpdateLedger } from "../updates/ledger";
@@ -72,6 +72,8 @@ export class JiraDeskBackend {
   async connect(credentials: BackendCredentials, signal?: AbortSignal): Promise<BackendSnapshot> {
     if (!credentials.email || !credentials.token) throw new BackendError("invalid_input", "Email and API token are required");
     throwIfAborted(signal);
+    let preferences: Preferences;
+    try { preferences = this.#preferences.load(); } catch (error) { throw mapPreferencesError(error, "load"); }
     let siteConfig: JiraHttpConfig;
     try { siteConfig = JiraHttpConfig.parse(credentials.baseUrl); } catch (error) { throw mapError(error); }
     let cloudId: string;
@@ -84,12 +86,15 @@ export class JiraDeskBackend {
     try { jira = this.#jiraFactory(credentials.baseUrl, credentials.email, credentials.token, cloudId); } catch (error) { throw mapError(error); }
     throwIfAborted(signal);
     let workspace: Workspace;
-    try { workspace = await Workspace.connect(jira, this.#cache, { siteId, siteLabel: siteId }, signal); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
+    const workspaceConfig = preferences.jqlScope === undefined
+      ? { siteId, siteLabel: siteId }
+      : { siteId, siteLabel: siteId, scope: preferences.jqlScope };
+    try { workspace = await Workspace.connect(jira, this.#cache, workspaceConfig, signal); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
     throwIfAborted(signal);
     const storedCredentials: CredentialParts = { baseUrl: credentials.baseUrl, email: credentials.email, token: credentials.token, siteId, cloudId };
     let snapshot = toBackendSnapshot(workspace.initialSnapshot());
     if (snapshot.issues.length === 0) {
-      try { snapshot = toBackendSnapshot(await workspace.refresh(undefined, signal)); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
+      try { snapshot = toBackendSnapshot(await workspace.refresh(signal)); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
     }
     throwIfAborted(signal);
     if (credentials.remember) {
@@ -105,10 +110,51 @@ export class JiraDeskBackend {
 
   async refresh(signal?: AbortSignal): Promise<BackendSnapshot> {
     if (!this.#workspace) throw new BackendError("authentication", "Connect to Jira first");
-    try { return toBackendSnapshot(await this.#workspace.refresh(undefined, signal)); } catch (error) {
+    try { return toBackendSnapshot(await this.#workspace.refresh(signal)); } catch (error) {
       if (signal?.aborted) throw cancelledError();
       throw mapWorkspaceError(error);
     }
+  }
+
+  /**
+   * Validate, refresh, persist, and then activate a new JQL scope. The
+   * workspace candidate commits its cache partition before preferences are
+   * saved, so every failure leaves the active view and persisted scope intact.
+   */
+  async applyJqlScope(scope: string | undefined, signal?: AbortSignal): Promise<{ snapshot: BackendSnapshot; preferences: Preferences }> {
+    let current: Preferences;
+    let normalized: Preferences;
+    try {
+      current = this.#preferences.load();
+      normalized = validatePreferences({ ...current, jqlScope: scope });
+    } catch (error) { throw mapPreferencesError(error, "load"); }
+    throwIfAborted(signal);
+    const workspace = this.#workspace;
+    if (!workspace) throw new BackendError("authentication", "Connect to Jira first");
+
+    let candidate: WorkspaceScopeCandidate;
+    try { candidate = await workspace.prepareJqlScope(normalized.jqlScope, signal); }
+    catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
+    throwIfAborted(signal);
+
+    let saved: Preferences;
+    try {
+      saved = this.#preferences.save({
+        version: normalized.version,
+        jqlScope: normalized.jqlScope,
+        teamMembers: current.teamMembers,
+        theme: current.theme,
+        noColor: current.noColor,
+        asciiOnly: current.asciiOnly,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw cancelledError();
+      throw mapPreferencesError(error, "save");
+    }
+    // Activation is synchronous and infallible for a candidate returned by
+    // this workspace; no fallible operation belongs between save and it.
+    const activated = workspace.activateJqlScope(candidate);
+    return { snapshot: toBackendSnapshot(activated), preferences: saved };
   }
 
   persistUpdateLedger(ledger: UpdateLedger): UpdateLedger {

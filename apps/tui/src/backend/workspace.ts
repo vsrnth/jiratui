@@ -1,5 +1,5 @@
 import { parseIssueKey, type IssueDetail, type IssueKey, type IssueSummary, type UserIdentity } from "../domain";
-import { IssueCache, type CacheIdentity, validateCacheIdentity } from "../storage/cache";
+import { IssueCache, scopePartitionSiteId, type CacheIdentity, validateCacheIdentity } from "../storage/cache";
 import { applyUpdateSnapshot, type UpdateLedger } from "../updates/ledger";
 import type { JiraReadPort, WorkspaceConfig } from "./ports";
 
@@ -19,14 +19,23 @@ export type WorkspaceSnapshot = Readonly<{
   refreshedAt: string;
 }>;
 
+/** A committed, inactive scope refresh ready for synchronous activation. */
+export type WorkspaceScopeCandidate = Readonly<{
+  workspace: Workspace;
+  scope: string | undefined;
+  cacheIdentity: CacheIdentity;
+  snapshot: WorkspaceSnapshot;
+}>;
+
 /** Framework-free read façade. It never exposes the transport credential. */
 export class Workspace {
   readonly #jira: JiraReadPort;
   readonly #cache: IssueCache;
-  readonly #config: WorkspaceConfig;
+  readonly #baseSiteId: string;
   readonly #identity: UserIdentity;
-  readonly #cacheIdentity: CacheIdentity;
   readonly #siteLabel: string;
+  #activeScope: string | undefined;
+  #cacheIdentity: CacheIdentity;
   #snapshot: IssueSummary[];
   #updates: UpdateLedger;
   #updatesBaselineEstablished: boolean;
@@ -41,7 +50,8 @@ export class Workspace {
     updates: UpdateLedger,
     updatesBaselineEstablished: boolean,
   ) {
-    this.#jira = jira; this.#cache = cache; this.#config = config; this.#identity = identity; this.#cacheIdentity = cacheIdentity;
+    this.#jira = jira; this.#cache = cache; this.#baseSiteId = config.siteId.trim(); this.#identity = identity;
+    this.#activeScope = config.scope?.trim() || undefined; this.#cacheIdentity = cacheIdentity;
     this.#siteLabel = config.siteLabel?.trim() || config.siteId;
     this.#snapshot = cached.slice();
     this.#updates = updates;
@@ -54,7 +64,7 @@ export class Workspace {
     let identity: UserIdentity;
     try { identity = await jira.myself(signal); } catch (error) { throw new WorkspaceError("authentication", "Jira identity verification failed", error); }
     if (!identity.accountId?.trim()) throw new WorkspaceError("authentication", "Jira did not return an account identity");
-    const cacheIdentity = validateCacheIdentity(config.siteId, identity.accountId);
+    const cacheIdentity = validateCacheIdentity(scopePartitionSiteId(config.siteId, config.scope), identity.accountId);
     let cached: ReturnType<IssueCache["loadWorkspace"]>;
     try { cached = cache.loadWorkspace(cacheIdentity); } catch { throw new WorkspaceError("storage", "Unable to load the local cache"); }
     // A pre-ledger cache can contain issues without a workspace-state row. It
@@ -71,11 +81,11 @@ export class Workspace {
   updatesBaselineEstablished(): boolean { return this.#updatesBaselineEstablished; }
   initialSnapshot(): WorkspaceSnapshot { return this.snapshot("cache"); }
 
-  async refresh(scope: string | undefined = this.#config.scope, signal?: AbortSignal): Promise<WorkspaceSnapshot> {
+  async refresh(signal?: AbortSignal): Promise<WorkspaceSnapshot> {
     let issues: readonly IssueSummary[];
     try {
       const options: { scope?: string; signal?: AbortSignal } = {};
-      if (scope !== undefined) options.scope = scope;
+      if (this.#activeScope !== undefined) options.scope = this.#activeScope;
       if (signal !== undefined) options.signal = signal;
       issues = await this.#jira.searchAssignedOrWatched(options);
     } catch (error) { throw new WorkspaceError("transport", "Unable to refresh assigned-or-watched issues", error); }
@@ -96,6 +106,65 @@ export class Workspace {
       this.#updates = committed.updates;
       this.#updatesBaselineEstablished = committed.baselineEstablished;
     } catch { throw new WorkspaceError("storage", "Unable to save the local workspace"); }
+    return this.snapshot("jira");
+  }
+
+  /**
+   * Refresh and commit an inactive scope partition. The returned candidate is
+   * intentionally inert until activateJqlScope is called by the backend after
+   * its preference transaction succeeds.
+   */
+  async prepareJqlScope(scope: string | undefined, signal?: AbortSignal): Promise<WorkspaceScopeCandidate> {
+    const normalizedScope = normalizeScope(scope);
+    const cacheIdentity = validateCacheIdentity(scopePartitionSiteId(this.#baseSiteId, normalizedScope), this.#identity.accountId);
+    let cached: ReturnType<IssueCache["loadWorkspace"]>;
+    try { cached = this.#cache.loadWorkspace(cacheIdentity); } catch { throw new WorkspaceError("storage", "Unable to load the local cache"); }
+    const baselineEstablished = cached.baselineEstablished || cached.issues.length > 0;
+    if (signal?.aborted) throw new WorkspaceError("transport", "Refresh cancelled");
+
+    let issues: readonly IssueSummary[];
+    try {
+      const options: { scope?: string; signal?: AbortSignal } = {};
+      if (normalizedScope !== undefined) options.scope = normalizedScope;
+      if (signal !== undefined) options.signal = signal;
+      issues = await this.#jira.searchAssignedOrWatched(options);
+    } catch (error) { throw new WorkspaceError("transport", "Unable to refresh assigned-or-watched issues", error); }
+    if (signal?.aborted) throw new WorkspaceError("transport", "Refresh cancelled");
+
+    const nextUpdates = applyUpdateSnapshot(
+      cached.updates,
+      baselineEstablished ? cached.issues : null,
+      issues,
+      { baseline: !baselineEstablished },
+    );
+    if (signal?.aborted) throw new WorkspaceError("transport", "Refresh cancelled");
+    let committed: ReturnType<IssueCache["commitWorkspace"]>;
+    try { committed = this.#cache.commitWorkspace(cacheIdentity, issues, nextUpdates, true); }
+    catch { throw new WorkspaceError("storage", "Unable to save the local workspace"); }
+    const snapshot: WorkspaceSnapshot = {
+      siteLabel: this.#siteLabel,
+      identity: this.#identity,
+      issues: committed.issues.slice(),
+      updates: committed.updates,
+      updatesBaselineEstablished: committed.baselineEstablished,
+      source: "jira",
+      refreshedAt: new Date().toISOString(),
+    };
+    return { workspace: this, scope: normalizedScope, cacheIdentity, snapshot };
+  }
+
+  /** Activate only a candidate created by this workspace; this is synchronous. */
+  activateJqlScope(candidate: WorkspaceScopeCandidate): WorkspaceSnapshot {
+    if (candidate.workspace !== this) throw new WorkspaceError("invalid_input", "Scope candidate does not belong to this workspace");
+    const expectedSiteId = scopePartitionSiteId(this.#baseSiteId, candidate.scope);
+    if (candidate.cacheIdentity.siteId !== expectedSiteId || candidate.cacheIdentity.accountId !== this.#identity.accountId) {
+      throw new WorkspaceError("invalid_input", "Scope candidate does not belong to this workspace");
+    }
+    this.#activeScope = candidate.scope;
+    this.#cacheIdentity = candidate.cacheIdentity;
+    this.#snapshot = candidate.snapshot.issues.slice();
+    this.#updates = candidate.snapshot.updates;
+    this.#updatesBaselineEstablished = candidate.snapshot.updatesBaselineEstablished;
     return this.snapshot("jira");
   }
 
@@ -129,4 +198,14 @@ export class Workspace {
       refreshedAt: new Date().toISOString(),
     };
   }
+}
+
+function normalizeScope(scope: string | undefined): string | undefined {
+  if (scope === undefined) return undefined;
+  if ([...scope].some((char) => /\p{Cc}/u.test(char))) throw new WorkspaceError("invalid_input", "JQL scope contains a control character");
+  const normalized = scope.trim();
+  if (!normalized) throw new WorkspaceError("invalid_input", "JQL scope must not be blank");
+  if (Buffer.byteLength(normalized, "utf8") > 2_000) throw new WorkspaceError("invalid_input", "JQL scope exceeds 2000 UTF-8 bytes");
+  if (/\border\s+by\b/iu.test(normalized)) throw new WorkspaceError("invalid_input", "JQL scope must not contain ORDER BY");
+  return normalized;
 }

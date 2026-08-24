@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { IssueCache } from "../src/storage/cache";
+import { IssueCache, scopePartitionSiteId } from "../src/storage/cache";
 import { JiraDeskBackend, Workspace } from "../src/backend";
 import { SystemCredentialStore, type CredentialResult, type SavedCredentials, type SecretProvider } from "../src/storage/credentials";
 import type { IssueDetail, IssueSummary } from "../src/domain";
@@ -15,9 +15,39 @@ const detail: IssueDetail = { issue: summary, issueType: "Task", reporter: "Ada"
 
 function fixture() {
   const dir = `/tmp/jira-desk-backend-${crypto.randomUUID()}`; dirs.push(dir); mkdirSync(dir, { recursive: true });
+  const env = { XDG_DATA_HOME: dir };
   let searches = 0;
   const jira = { async myself() { return { accountId: "acct-1", displayName: "Ada" }; }, async searchAssignedOrWatched() { searches += 1; return [summary]; }, async issueDetail() { return detail; } };
-  return { jira, cache: new IssueCache(join(dir, "jira-desk.sqlite3")), get searches() { return searches; } };
+  return { jira, cache: new IssueCache(join(dir, "jira-desk.sqlite3")), env, get searches() { return searches; } };
+}
+
+function testCredentials(): SystemCredentialStore {
+  return {
+    async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; },
+    async save() { return { kind: "ok", value: true } as const; },
+    async delete() { return { kind: "ok", value: true } as const; },
+  } as unknown as SystemCredentialStore;
+}
+
+function scopeBackendFixture(results: Record<string, readonly IssueSummary[]>) {
+  const dir = `/tmp/jira-desk-scope-backend-${crypto.randomUUID()}`;
+  dirs.push(dir);
+  mkdirSync(dir, { recursive: true });
+  const env = { XDG_DATA_HOME: dir };
+  const cache = new IssueCache(join(dir, "cache.sqlite3"));
+  const preferences = new PreferencesStore(env);
+  const calls: (string | undefined)[] = [];
+  const jira = {
+    async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+    async searchAssignedOrWatched(options?: { scope?: string }) {
+      const scope = typeof options === "object" ? options?.scope : undefined;
+      calls.push(scope);
+      return results[scope ?? "default"] ?? [];
+    },
+    async issueDetail() { return detail; },
+  };
+  const backend = new JiraDeskBackend({ cache, credentials: testCredentials(), env, preferences, jiraFactory: () => jira });
+  return { dir, env, cache, preferences, jira, backend, calls };
 }
 
 describe("Workspace", () => {
@@ -119,6 +149,145 @@ describe("Workspace", () => {
 });
 
 describe("JiraDeskBackend", () => {
+  test("connects with persisted scope and reads its opaque partition", async () => {
+    const scoped = { ...summary, key: "SCOPE-1" as IssueSummary["key"] };
+    const fixtureData = scopeBackendFixture({ default: [summary], "project = DEV": [scoped] });
+    fixtureData.preferences.save({ jqlScope: " project = DEV ", teamMembers: [], theme: "Dark", noColor: true, asciiOnly: false });
+    const identities: string[] = [];
+    const originalLoad = fixtureData.cache.loadWorkspace.bind(fixtureData.cache);
+    fixtureData.cache.loadWorkspace = ((identity) => { identities.push(identity.siteId); return originalLoad(identity); }) as typeof fixtureData.cache.loadWorkspace;
+    const snapshot = await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    expect(snapshot.issues).toEqual([scoped]);
+    expect(fixtureData.calls).toEqual(["project = DEV"]);
+    expect(identities[0]).toBe(scopePartitionSiteId("example.atlassian.net", "project = DEV"));
+    expect(identities[0]).not.toContain("project = DEV");
+    fixtureData.backend.close();
+  });
+
+  test("commits a new scope before saving preferences and keeps independent ledgers", async () => {
+    const changed = { ...summary, summary: "Changed", updated: "2026-02-01" };
+    const scoped = { ...summary, key: "SCOPE-1" as IssueSummary["key"], summary: "Scoped" };
+    const results: Record<string, readonly IssueSummary[]> = { default: [summary], "project = DEV": [scoped] };
+    const fixtureData = scopeBackendFixture(results);
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    results.default = [changed];
+    const defaultChanged = await fixtureData.backend.refresh();
+    fixtureData.backend.persistUpdateLedger(markGroupsRead(defaultChanged.updates, [summary.id], true, [summary.id]));
+
+    const order: string[] = [];
+    const originalCommit = fixtureData.cache.commitWorkspace.bind(fixtureData.cache);
+    fixtureData.cache.commitWorkspace = ((identity, issues, updates, baseline) => { order.push("cache"); return originalCommit(identity, issues, updates, baseline); }) as typeof fixtureData.cache.commitWorkspace;
+    const originalSave = fixtureData.preferences.save.bind(fixtureData.preferences);
+    fixtureData.preferences.save = ((input) => { order.push("preferences"); return originalSave(input); }) as typeof fixtureData.preferences.save;
+    const switched = await fixtureData.backend.applyJqlScope("  project = DEV  ");
+    expect(order).toEqual(["cache", "preferences"]);
+    expect(switched.snapshot.issues).toEqual([scoped]);
+    expect(switched.snapshot.updates.events).toEqual([]);
+    expect(switched.preferences.jqlScope).toBe("project = DEV");
+    expect(switched.preferences.theme).toBe("System");
+    expect(fixtureData.calls.at(-1)).toBe("project = DEV");
+
+    const refreshed = await fixtureData.backend.refresh();
+    expect(refreshed.issues).toEqual([scoped]);
+    expect(fixtureData.calls.at(-1)).toBe("project = DEV");
+
+    const back = await fixtureData.backend.applyJqlScope(undefined);
+    expect(back.preferences.jqlScope).toBeUndefined();
+    expect(back.snapshot.updates.events).toHaveLength(1);
+    expect(back.snapshot.updates.readIssueIds).toEqual([summary.id]);
+    fixtureData.backend.close();
+  });
+
+  test("rejects invalid scopes locally without a Jira search", async () => {
+    const fixtureData = scopeBackendFixture({ default: [summary], "project = DEV": [summary] });
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    fixtureData.calls.length = 0;
+    for (const invalid of ["", "   ", "project = DEV ORDER BY updated DESC", "project = DEV\n", "é".repeat(1001)]) {
+      await expect(fixtureData.backend.applyJqlScope(invalid)).rejects.toMatchObject({ category: "invalid_input" });
+    }
+    expect(fixtureData.calls).toEqual([]);
+    fixtureData.backend.close();
+  });
+
+  test("preserves the active workspace on Jira and target cache failures", async () => {
+    const scoped = { ...summary, key: "SCOPE-1" as IssueSummary["key"] };
+    const results: Record<string, readonly IssueSummary[]> = { default: [summary], "project = DEV": [scoped] };
+    const fixtureData = scopeBackendFixture(results);
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+
+    results["project = DEV"] = [];
+    const originalJiraSearch = fixtureData.jira.searchAssignedOrWatched;
+    fixtureData.jira.searchAssignedOrWatched = async (options?: { scope?: string }) => {
+      if (options?.scope === "project = DEV") throw new Error("offline");
+      return originalJiraSearch(options);
+    };
+    await expect(fixtureData.backend.applyJqlScope("project = DEV")).rejects.toMatchObject({ category: "internal" });
+    expect(fixtureData.preferences.load().jqlScope).toBeUndefined();
+    expect((await fixtureData.backend.refresh()).issues).toEqual([summary]);
+
+    fixtureData.jira.searchAssignedOrWatched = originalJiraSearch;
+    const originalCommit = fixtureData.cache.commitWorkspace.bind(fixtureData.cache);
+    const targetSite = scopePartitionSiteId("example.atlassian.net", "project = DEV");
+    fixtureData.cache.commitWorkspace = ((identity, issues, updates, baseline) => {
+      if (identity.siteId === targetSite) throw new Error("target cache unavailable");
+      return originalCommit(identity, issues, updates, baseline);
+    }) as typeof fixtureData.cache.commitWorkspace;
+    await expect(fixtureData.backend.applyJqlScope("project = DEV")).rejects.toMatchObject({ category: "storage" });
+    expect((await fixtureData.backend.refresh()).issues).toEqual([summary]);
+    fixtureData.backend.close();
+  });
+
+  test("retains old preferences when target commit succeeds but preference save fails", async () => {
+    const scoped = { ...summary, key: "SCOPE-1" as IssueSummary["key"] };
+    const fixtureData = scopeBackendFixture({ default: [summary], "project = DEV": [scoped] });
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    const originalSave = fixtureData.preferences.save.bind(fixtureData.preferences);
+    fixtureData.preferences.save = (() => { throw new Error("preference disk full"); }) as typeof fixtureData.preferences.save;
+    await expect(fixtureData.backend.applyJqlScope("project = DEV")).rejects.toMatchObject({ category: "internal" });
+    expect(fixtureData.preferences.load().jqlScope).toBeUndefined();
+    expect((await fixtureData.backend.refresh()).issues).toEqual([summary]);
+    const target = fixtureData.cache.loadWorkspace({ siteId: scopePartitionSiteId("example.atlassian.net", "project = DEV"), accountId: "acct-1" });
+    expect(target.issues).toEqual([scoped]);
+    fixtureData.preferences.save = originalSave;
+    fixtureData.backend.close();
+  });
+
+  test("cancels scope switching without publishing it", async () => {
+    const fixtureData = scopeBackendFixture({ default: [summary], "project = DEV": [summary] });
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    const controller = new AbortController();
+    const originalSearch = fixtureData.jira.searchAssignedOrWatched;
+    fixtureData.jira.searchAssignedOrWatched = async (options?: { scope?: string }) => {
+      if (options?.scope === "project = DEV") controller.abort();
+      return originalSearch(options);
+    };
+    await expect(fixtureData.backend.applyJqlScope("project = DEV", controller.signal)).rejects.toMatchObject({ category: "cancelled" });
+    expect(fixtureData.preferences.load().jqlScope).toBeUndefined();
+    expect((await fixtureData.backend.refresh()).issues).toEqual([summary]);
+    fixtureData.backend.close();
+  });
+
+  test("restarts using the successfully saved scope partition", async () => {
+    const scoped = { ...summary, key: "SCOPE-1" as IssueSummary["key"] };
+    const fixtureData = scopeBackendFixture({ default: [summary], "project = DEV": [scoped] });
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    await fixtureData.backend.applyJqlScope("project = DEV");
+    fixtureData.calls.length = 0;
+    fixtureData.backend.close();
+    const second = new JiraDeskBackend({
+      cache: new IssueCache(join(fixtureData.dir, "cache.sqlite3")),
+      credentials: testCredentials(),
+      env: fixtureData.env,
+      preferences: new PreferencesStore(fixtureData.env),
+      jiraFactory: () => fixtureData.jira,
+    });
+    const restored = await second.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    expect(restored.source).toBe("cache");
+    expect(restored.issues).toEqual([scoped]);
+    expect(fixtureData.calls).toEqual([]);
+    second.close();
+  });
+
   test("loads default preferences and round-trips appearance across backend instances", () => {
     const dir = `/tmp/jira-desk-preferences-backend-${crypto.randomUUID()}`;
     dirs.push(dir);
@@ -203,7 +372,7 @@ describe("JiraDeskBackend", () => {
   test("connects through a Jira port, returns domain snapshots, and never returns credentials", async () => {
     const fixtureData = fixture();
     const credentialStore = { async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; }, async save() { return { kind: "ok", value: true } as const; }, async delete() { return { kind: "ok", value: true } as const; } } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
     const snapshot = await backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     expect(snapshot.identity).toBe("Ada");
     expect(snapshot.issues[0]?.key as string | undefined).toBe("DEV-1");
@@ -230,6 +399,7 @@ describe("JiraDeskBackend", () => {
     const first = new JiraDeskBackend({
       cache: new IssueCache(databasePath),
       credentials: credentialStore,
+      env: jiraFixture.env,
       jiraFactory: () => jira,
     });
     await first.connect({
@@ -246,6 +416,7 @@ describe("JiraDeskBackend", () => {
     const second = new JiraDeskBackend({
       cache: new IssueCache(databasePath),
       credentials: credentialStore,
+      env: jiraFixture.env,
       jiraFactory: () => jira,
     });
     const restored = await second.bootstrap();
@@ -273,7 +444,7 @@ describe("JiraDeskBackend", () => {
       async save() { return { kind: "ok", value: true } as const; },
       async delete() { return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const first = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, jiraFactory: () => jira });
+    const first = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, env: { XDG_DATA_HOME: dir }, jiraFactory: () => jira });
     await first.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     current = { ...summary, summary: "Changed", updated: "2026-02-01" };
     const changed = await first.refresh();
@@ -281,7 +452,7 @@ describe("JiraDeskBackend", () => {
     first.persistUpdateLedger(read);
     first.close();
 
-    const second = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, jiraFactory: () => jira });
+    const second = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, env: { XDG_DATA_HOME: dir }, jiraFactory: () => jira });
     const restored = await second.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     expect(restored.source).toBe("cache");
     expect(restored.updates.events).toHaveLength(1);
@@ -291,7 +462,7 @@ describe("JiraDeskBackend", () => {
 
   test("requires authentication to persist local updates", () => {
     const fixtureData = fixture();
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
     expect(() => backend.persistUpdateLedger(emptyUpdateLedger())).toThrow(
       expect.objectContaining({ category: "authentication" }),
     );
@@ -332,7 +503,7 @@ describe("JiraDeskBackend", () => {
       async save() { return { kind: "ok", value: true } as const; },
       async delete() { return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, jiraFactory: () => jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => jira });
 
     await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false }, controller.signal)).rejects.toMatchObject({ category: "cancelled", message: "Connection cancelled" });
     await expect(backend.refresh()).rejects.toMatchObject({ category: "authentication" });
@@ -367,6 +538,7 @@ describe("JiraDeskBackend", () => {
     const backend = new JiraDeskBackend({
       cache: fixtureData.cache,
       credentials: credentialStore,
+      env: fixtureData.env,
       jiraFactory: (_baseUrl, _email, token) => token === "old-token" ? originalJira : replacementJira,
     });
 
@@ -391,7 +563,7 @@ describe("JiraDeskBackend", () => {
       async save() { saves += 1; return { kind: "ok", value: true } as const; },
       async delete() { return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
 
     await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: true }, controller.signal)).rejects.toMatchObject({ category: "cancelled", message: "Connection cancelled" });
     expect(saves).toBe(0);
@@ -406,7 +578,7 @@ describe("JiraDeskBackend", () => {
       async save() { return { kind: "ok", value: true } as const; },
       async delete() { deletes += 1; return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
 
     await backend.forgetSavedLogin();
     expect(deletes).toBe(1);
