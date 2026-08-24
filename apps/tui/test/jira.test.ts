@@ -11,6 +11,8 @@ import {
   assignedOrWatchedJql,
   discoverCloudId,
   mapIssueDetail,
+  mapTeamMember,
+  teamIssuesJql,
 } from "../src/jira/index";
 
 const issue = {
@@ -37,6 +39,15 @@ describe("pure Jira mapping", () => {
     expect(() => assignedOrWatchedJql("project = DEV ORDER BY created")).toThrow(JiraError);
   });
 
+  test("builds fixed team JQL with stable account-ID deduplication", () => {
+    expect(teamIssuesJql(["acct-a", "acct-a", "acct-b"])).toBe(
+      'statusCategory = "In Progress" AND assignee IN ("acct-a", "acct-b") ORDER BY updated DESC',
+    );
+    expect(() => teamIssuesJql([])).toThrow(JiraError);
+    expect(() => teamIssuesJql(["acct\"unsafe"])).toThrow(JiraError);
+    expect(() => teamIssuesJql(Array.from({ length: 101 }, (_, index) => `acct-${index}`))).toThrow(JiraError);
+  });
+
   test("keeps unsupported ADF visible and links inert", () => {
     expect(adfToText({ type: "doc", content: [{ type: "paragraph", content: [
       { type: "text", text: "Jira", marks: [{ type: "link", attrs: { href: "https://example.test" } }] },
@@ -49,6 +60,13 @@ describe("pure Jira mapping", () => {
     expect(result.issue.key as string).toBe("DEV-123");
     expect(result.issue.statusCategory).toBe("in_progress");
     expect(result.remote).toBe(true);
+  });
+
+  test("bounds resolved display names by characters and UTF-8 bytes", () => {
+    const result = mapTeamMember({ accountId: "acct-1", active: true, displayName: "😀".repeat(500) });
+    expect([...result.displayName]).toHaveLength(63);
+    expect(new TextEncoder().encode(result.displayName).length).toBeLessThanOrEqual(255);
+    expect(mapTeamMember({ accountId: "acct-1", active: true, displayName: "a".repeat(500) }).displayName).toHaveLength(255);
   });
 
   test("requires an authenticated account identity", async () => {
@@ -139,6 +157,80 @@ describe("Jira HTTP boundary", () => {
       expect(requests.find((request) => request.url.includes("/issue/"))?.url).toContain("created");
       expect(requests.find((request) => request.url.includes("/comment?"))?.url).toContain("maxResults=100");
       expect(requests.some((request) => request.method === "PUT" || request.method === "DELETE")).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("resolves active account IDs and unique active email matches without writes", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Request[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (request.url.includes("/user/search?")) {
+        return new Response(JSON.stringify([{ accountId: "acct-email", displayName: "Email User", active: true }]), { status: 200 });
+      }
+      const inactive = request.url.includes("acct%2Finactive");
+      return new Response(JSON.stringify({ accountId: inactive ? "acct-inactive" : "acct-id", displayName: "ID User", active: !inactive }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const client = JiraHttpClient.from("https://example.atlassian.net", "ada@example.test", "secret-token", "cloud-123");
+      await expect(client.resolveTeamMember("acct/id")).resolves.toEqual({ accountId: "acct-id", displayName: "ID User" });
+      await expect(client.resolveTeamMember("acct/inactive")).rejects.toMatchObject({ category: "not_found" });
+      await expect(client.resolveTeamMember("email@example.test")).resolves.toEqual({ accountId: "acct-email", displayName: "Email User" });
+      expect(requests[0]?.method).toBe("GET");
+      expect(requests[0]?.url).toContain("accountId=acct%2Fid");
+      expect(requests[2]?.url).toContain("query=email%40example.test");
+      expect(requests[2]?.url).toContain("maxResults=2");
+      expect(requests.every((request) => request.method === "GET")).toBe(true);
+      await expect(client.resolveTeamMember("bad\"id")).rejects.toMatchObject({ category: "invalid_input" });
+      await expect(client.resolveTeamMember("bad@example.test\u0000")).rejects.toMatchObject({ category: "invalid_input" });
+      expect(requests).toHaveLength(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("requires exactly one active email result and reuses bounded team search pagination", async () => {
+    const originalFetch = globalThis.fetch;
+    let emailMode: "multiple" | "mixed" | "inactive" | "unique" = "multiple";
+    let searchCalls = 0;
+    const searchRequests: Request[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.includes("/user/search?")) {
+        const result = emailMode === "multiple"
+          ? [{ accountId: "a", active: true }, { accountId: "b", active: true }]
+          : emailMode === "mixed"
+            ? [{ accountId: "a", displayName: "A", active: true }, { accountId: "inactive", active: false }]
+          : emailMode === "inactive"
+            ? [{ accountId: "a", active: false }]
+            : [{ accountId: "a", displayName: "A", active: true }];
+        return new Response(JSON.stringify(result), { status: 200 });
+      }
+      searchRequests.push(request);
+      searchCalls += 1;
+      const body = searchCalls === 1 ? { issues: [issue], nextPageToken: "next" } : { issues: [], isLast: true };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const client = JiraHttpClient.from("https://example.atlassian.net", "ada@example.test", "token", "cloud-123");
+      await expect(client.resolveTeamMember("team@example.test")).rejects.toMatchObject({ category: "not_found" });
+      emailMode = "mixed";
+      await expect(client.resolveTeamMember("team@example.test")).resolves.toEqual({ accountId: "a", displayName: "A" });
+      emailMode = "inactive";
+      await expect(client.resolveTeamMember("team@example.test")).rejects.toMatchObject({ category: "not_found" });
+      emailMode = "unique";
+      await expect(client.resolveTeamMember("team@example.test")).resolves.toEqual({ accountId: "a", displayName: "A" });
+      await expect(client.searchTeamIssues(["a", "b"])).resolves.toHaveLength(1);
+      expect(searchCalls).toBe(2);
+      expect(searchRequests.every((request) => request.method === "POST")).toBe(true);
+      const firstSearch = JSON.parse(await searchRequests[0]!.clone().text()) as { jql: string; nextPageToken?: string; fields: string[] };
+      expect(firstSearch.jql).toBe('statusCategory = "In Progress" AND assignee IN ("a", "b") ORDER BY updated DESC');
+      expect(firstSearch.jql).not.toContain("watcher");
+      const secondSearch = JSON.parse(await searchRequests[1]!.clone().text()) as { nextPageToken?: string };
+      expect(secondSearch.nextPageToken).toBe("next");
     } finally {
       globalThis.fetch = originalFetch;
     }

@@ -12,6 +12,63 @@ export class DomainValidationError extends Error {
   }
 }
 
+export const MAX_TEAM_ACCOUNT_ID_BYTES = 256;
+export const MAX_TEAM_DISPLAY_NAME_BYTES = 255;
+export const MAX_TEAM_DISPLAY_NAME_CHARS = 255;
+
+/** A resolved, renderer-neutral Jira team identity. */
+export type TeamMember = Readonly<{
+  accountId: string;
+  displayName: string;
+}>;
+
+/** Validate the stable Jira account identifier used in team JQL. */
+export function parseTeamAccountId(value: string): string {
+  if (typeof value !== "string") throw new DomainValidationError("team account id is invalid");
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    new TextEncoder().encode(normalized).length > MAX_TEAM_ACCOUNT_ID_BYTES ||
+    [...normalized].some((char) => /\p{Cc}/u.test(char)) ||
+    normalized.includes('"') ||
+    normalized.includes("'") ||
+    normalized.includes("\\")
+  ) throw new DomainValidationError("team account id is invalid");
+  return normalized;
+}
+
+/** Validate an Atlassian email identifier without retaining it in an error. */
+export function parseTeamEmail(value: string): string {
+  if (typeof value !== "string") throw new DomainValidationError("team email is invalid");
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    new TextEncoder().encode(normalized).length > 320 ||
+    [...normalized].some((char) => /\p{Cc}/u.test(char)) ||
+    normalized.includes('"') ||
+    normalized.includes("\\") ||
+    !/^[^@\s]+@[^@\s]+$/u.test(normalized)
+  ) throw new DomainValidationError("team email is invalid");
+  return normalized;
+}
+
+/** Bound user-facing text by UTF-8 bytes as well as display characters. */
+export function safeDisplayBytes(value: unknown, fallback: string, maxBytes: number, maxChars = maxBytes): string {
+  const candidate = typeof value === "string" && value.length > 0 ? value : fallback;
+  const clean = [...candidate].filter((char) => !/\p{Cc}/u.test(char)).slice(0, maxChars).join("");
+  let output = "";
+  let bytes = 0;
+  for (const char of clean) {
+    const size = new TextEncoder().encode(char).length;
+    if (bytes + size > maxBytes) break;
+    output += char;
+    bytes += size;
+  }
+  if (output.length > 0) return output;
+  if (candidate === fallback) return output;
+  return safeDisplayBytes(fallback, "", maxBytes, maxChars);
+}
+
 export function parseIssueId(value: string): IssueId {
   if (!isSafeText(value, 255) || value.length === 0) {
     throw new DomainValidationError("invalid Jira issue id");

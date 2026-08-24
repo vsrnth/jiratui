@@ -1,7 +1,7 @@
-import { parseIssueKey, type IssueComment, type IssueDetail, type IssueKey, type IssueSummary, type UserIdentity } from "../domain/index";
+import { parseIssueKey, parseTeamAccountId, parseTeamEmail, type IssueComment, type IssueDetail, type IssueKey, type IssueSummary, type TeamMember, type UserIdentity } from "../domain/index";
 import { JiraError } from "./errors";
-import { assignedOrWatchedJql } from "./jql";
-import { mapComment, mapIssueDetail, mapIssueSummary, mapMyself } from "./mapping";
+import { assignedOrWatchedJql, teamIssuesJql } from "./jql";
+import { mapComment, mapIssueDetail, mapIssueSummary, mapMyself, mapTeamMember } from "./mapping";
 
 export const CONNECT_TIMEOUT_MS = 10_000;
 export const REQUEST_TIMEOUT_MS = 30_000;
@@ -90,7 +90,35 @@ export class JiraHttpClient {
 
   async searchAssignedOrWatched(options: SearchOptions | string = {}): Promise<IssueSummary[]> {
     const normalized: SearchOptions = typeof options === "string" ? { scope: options } : options;
-    const jql = assignedOrWatchedJql(normalized.scope);
+    return this.searchJql(assignedOrWatchedJql(normalized.scope), normalized.signal);
+  }
+
+  async resolveTeamMember(identifier: string, signal?: AbortSignal): Promise<TeamMember> {
+    let normalized: string;
+    const isEmail = typeof identifier === "string" && identifier.includes("@");
+    try {
+      if (typeof identifier !== "string") throw new Error("invalid identifier");
+      normalized = isEmail ? parseTeamEmail(identifier) : parseTeamAccountId(identifier);
+    } catch {
+      throw new JiraError("invalid_input", "Team member identifier is invalid");
+    }
+    if (isEmail) {
+      const path = `/rest/api/3/user/search?query=${encodeURIComponent(normalized)}&maxResults=2`;
+      const payload = await this.requestJson(path, { method: "GET" }, signal);
+      const matches = Array.isArray(payload) ? payload : [];
+      const activeMatches = matches.filter((match) => payloadRecord(match).active === true);
+      if (activeMatches.length !== 1) throw new JiraError("not_found", "Jira team member could not be resolved");
+      return mapTeamMember(activeMatches[0]);
+    }
+    const path = `/rest/api/3/user?accountId=${encodeURIComponent(normalized)}`;
+    return mapTeamMember(await this.requestJson(path, { method: "GET" }, signal));
+  }
+
+  async searchTeamIssues(accountIds: readonly string[], signal?: AbortSignal): Promise<IssueSummary[]> {
+    return this.searchJql(teamIssuesJql(accountIds), signal);
+  }
+
+  private async searchJql(jql: string, signal?: AbortSignal): Promise<IssueSummary[]> {
     const issues: IssueSummary[] = [];
     let nextPageToken: string | undefined;
     for (let page = 0; page < MAX_SEARCH_PAGES; page += 1) {
@@ -100,7 +128,7 @@ export class JiraHttpClient {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-      }, normalized.signal);
+      }, signal);
       const pageIssues = arrayProperty(payload, "issues");
       if (pageIssues.length > SEARCH_PAGE_SIZE) throw new JiraError("pagination", "Jira returned an oversized issue page");
       issues.push(...pageIssues.map(mapIssueSummary));

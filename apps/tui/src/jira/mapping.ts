@@ -3,11 +3,16 @@ import {
   type IssueComment,
   type IssueDetail,
   type IssueSummary,
+  type TeamMember,
+  parseTeamAccountId,
   parseIssueId,
   parseIssueKey,
   type StatusCategory,
   type UserIdentity,
+  MAX_TEAM_DISPLAY_NAME_BYTES,
+  MAX_TEAM_DISPLAY_NAME_CHARS,
   safeDisplay,
+  safeDisplayBytes,
 } from "../domain/index";
 import { JiraError } from "./errors";
 
@@ -43,6 +48,24 @@ export function mapMyself(value: unknown): UserIdentity {
     accountId: normalizedAccountId,
     displayName: safeDisplay(stringValue(item, "displayName"), "Unknown user", 255),
     ...(email ? { email: safeDisplay(email, "", 320) } : {}),
+  };
+}
+
+/** Map the minimal active-user response used for Team member resolution. */
+export function mapTeamMember(value: unknown): TeamMember {
+  const item = record(value);
+  if (item.active !== true) throw new JiraError("not_found", "Jira team member is not active or unavailable");
+  const rawAccountId = stringValue(item, "accountId");
+  if (rawAccountId === undefined) throw new JiraError("upstream", "Jira returned an invalid team member");
+  let accountId: string;
+  try {
+    accountId = parseTeamAccountId(rawAccountId);
+  } catch {
+    throw new JiraError("upstream", "Jira returned an invalid team member");
+  }
+  return {
+    accountId,
+    displayName: safeDisplayBytes(stringValue(item, "displayName"), "Unknown user", MAX_TEAM_DISPLAY_NAME_BYTES, MAX_TEAM_DISPLAY_NAME_CHARS),
   };
 }
 
