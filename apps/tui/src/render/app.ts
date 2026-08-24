@@ -25,7 +25,7 @@ function statusFilterLabel(filter: readonly StatusCategory[]): string {
 }
 
 function clearRoot(renderer: Context): void {
-  for (const child of renderer.root.getChildren()) child.destroy();
+  for (const child of renderer.root.getChildren()) child.destroyRecursively();
 }
 
 function titleBar(ctx: Context, state: RootState): BoxRenderable {
@@ -162,6 +162,10 @@ function secondarySection(ctx: Context, state: RootState): BoxRenderable {
 }
 
 export function renderApp(renderer: CliRenderer, state: RootState): void {
+  // OpenTUI registers one selection listener per selectable renderable. Keep
+  // the emitter warning-free for legitimate frames; recursive root cleanup
+  // prevents those listeners from accumulating across redraws.
+  renderer.setMaxListeners(0);
   clearRoot(renderer);
   const root = box(renderer, { width: "100%", height: "100%", backgroundColor: C.bg });
   add(root, titleBar(renderer, state));

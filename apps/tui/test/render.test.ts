@@ -129,4 +129,31 @@ describe("OpenTUI frames", () => {
       setup.renderer.destroy();
     }
   });
+
+  test("does not accumulate selection listeners across repeated redraws", async () => {
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      const state = reduce(initialState({ width: 120, height: 40 }), {
+        type: "workspace_snapshot",
+        siteLabel: "example.atlassian.net",
+        identity: "Ada",
+        issues: [issue],
+        source: "cache",
+        refreshedAt: "now",
+        generation: 0,
+      });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const firstListenerCount = setup.renderer.listenerCount("selection");
+      expect(firstListenerCount).toBeGreaterThan(0);
+
+      for (let redraw = 0; redraw < 25; redraw += 1) {
+        renderApp(setup.renderer, state);
+        await setup.renderOnce();
+        expect(setup.renderer.listenerCount("selection")).toBe(firstListenerCount);
+      }
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
 });
