@@ -2,6 +2,7 @@ import { discoverCloudId, JiraHttpClient, JiraHttpConfig } from "../jira";
 import { isJiraError, type JiraError, type JiraErrorCategory } from "../jira/errors";
 import { IssueCache } from "../storage/cache";
 import { SystemCredentialStore, type CredentialParts } from "../storage/credentials";
+import { PreferencesStore, PreferencesError, type Preferences } from "../storage/preferences";
 import { Workspace, WorkspaceError, type WorkspaceSnapshot } from "./workspace";
 import type { JiraReadPort } from "./ports";
 import type { IssueDetail, IssueSummary } from "../domain";
@@ -30,6 +31,7 @@ export class BackendError extends Error {
 type Dependencies = Readonly<{
   cache?: IssueCache;
   credentials?: SystemCredentialStore;
+  preferences?: PreferencesStore;
   env?: Record<string, string | undefined>;
   jiraFactory?: (baseUrl: string, email: string, token: string, cloudId: string) => JiraReadPort;
   cloudIdDiscovery?: (baseUrl: string, signal?: AbortSignal) => Promise<string>;
@@ -39,6 +41,7 @@ type Dependencies = Readonly<{
 export class JiraDeskBackend {
   readonly #cache: IssueCache;
   readonly #credentialStore: SystemCredentialStore;
+  readonly #preferences: PreferencesStore;
   readonly #env: Record<string, string | undefined>;
   readonly #jiraFactory: (baseUrl: string, email: string, token: string, cloudId: string) => JiraReadPort;
   readonly #cloudIdDiscovery: (baseUrl: string, signal?: AbortSignal) => Promise<string>;
@@ -48,6 +51,7 @@ export class JiraDeskBackend {
     try { this.#cache = dependencies.cache ?? IssueCache.openDefault(dependencies.env); } catch (error) { throw new BackendError("storage", "Unable to open the local cache", error); }
     this.#credentialStore = dependencies.credentials ?? new SystemCredentialStore();
     this.#env = dependencies.env ?? process.env;
+    this.#preferences = dependencies.preferences ?? new PreferencesStore(this.#env);
     this.#jiraFactory = dependencies.jiraFactory ?? ((baseUrl, email, token, cloudId) => JiraHttpClient.from(baseUrl, email, token, cloudId));
     this.#cloudIdDiscovery = dependencies.cloudIdDiscovery ?? discoverCloudId;
   }
@@ -122,6 +126,24 @@ export class JiraDeskBackend {
     if (result.kind === "unavailable") throw new BackendError("storage", result.message);
   }
 
+  loadPreferences(): Preferences {
+    try { return this.#preferences.load(); } catch (error) { throw mapPreferencesError(error, "load"); }
+  }
+
+  saveAppearancePreferences(input: { theme: "System" | "Light" | "Dark"; noColor: boolean; asciiOnly: boolean }): Preferences {
+    try {
+      const current = this.#preferences.load();
+      return this.#preferences.save({
+        version: current.version,
+        jqlScope: current.jqlScope,
+        teamMembers: current.teamMembers,
+        theme: input.theme,
+        noColor: input.noColor,
+        asciiOnly: input.asciiOnly,
+      });
+    } catch (error) { throw mapPreferencesError(error, "save"); }
+  }
+
   close(): void { this.#workspace = null; this.#cache.close(); }
 
   private environmentCredentials(): BackendCredentials | null {
@@ -166,6 +188,14 @@ function mapError(error: unknown, fallback = "Jira request failed"): BackendErro
   if (isJiraError(error)) return new BackendError(error.category, safeJiraMessage(error), error);
   if (error instanceof BackendError) return error;
   return new BackendError("internal", fallback, error);
+}
+
+function mapPreferencesError(error: unknown, operation: "load" | "save"): BackendError {
+  if (error instanceof PreferencesError) {
+    if (error.code === "invalid") return new BackendError("invalid_input", "Preferences are invalid");
+    return new BackendError("storage", "Unable to access local preferences");
+  }
+  return new BackendError("internal", operation === "load" ? "Unable to load preferences" : "Unable to save preferences");
 }
 
 function safeJiraMessage(error: JiraError): string {

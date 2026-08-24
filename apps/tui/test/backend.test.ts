@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { IssueCache } from "../src/storage/cache";
 import { JiraDeskBackend, Workspace } from "../src/backend";
 import { SystemCredentialStore, type CredentialResult, type SavedCredentials, type SecretProvider } from "../src/storage/credentials";
 import type { IssueDetail, IssueSummary } from "../src/domain";
 import { emptyUpdateLedger, markGroupsRead } from "../src/updates/ledger";
+import { PreferencesStore } from "../src/storage/preferences";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -118,6 +119,87 @@ describe("Workspace", () => {
 });
 
 describe("JiraDeskBackend", () => {
+  test("loads default preferences and round-trips appearance across backend instances", () => {
+    const dir = `/tmp/jira-desk-preferences-backend-${crypto.randomUUID()}`;
+    dirs.push(dir);
+    mkdirSync(dir, { recursive: true });
+    const env = { XDG_DATA_HOME: dir };
+    const first = new JiraDeskBackend({ env, cache: new IssueCache(join(dir, "first.sqlite3")), preferences: new PreferencesStore(env) });
+
+    expect(first.loadPreferences()).toEqual({ version: 1, teamMembers: [], theme: "System", noColor: false, asciiOnly: false });
+    expect(first.saveAppearancePreferences({ theme: "Dark", noColor: true, asciiOnly: true })).toEqual({ version: 1, teamMembers: [], theme: "Dark", noColor: true, asciiOnly: true });
+    first.close();
+
+    const second = new JiraDeskBackend({ env, cache: new IssueCache(join(dir, "second.sqlite3")), preferences: new PreferencesStore(env) });
+    expect(second.loadPreferences()).toEqual({ version: 1, teamMembers: [], theme: "Dark", noColor: true, asciiOnly: true });
+    second.close();
+  });
+
+  test("preserves JQL scope and team members when saving appearance", () => {
+    const dir = `/tmp/jira-desk-preferences-preserve-${crypto.randomUUID()}`;
+    dirs.push(dir);
+    mkdirSync(dir, { recursive: true });
+    const env = { XDG_DATA_HOME: dir };
+    const preferences = new PreferencesStore(env);
+    preferences.save({ jqlScope: "project = DEV", teamMembers: ["ada@example.test", "grace@example.test"], theme: "Light", noColor: false, asciiOnly: false });
+    const backend = new JiraDeskBackend({ env, cache: new IssueCache(join(dir, "cache.sqlite3")), preferences });
+
+    expect(backend.saveAppearancePreferences({ theme: "Dark", noColor: true, asciiOnly: true })).toEqual({
+      version: 1,
+      jqlScope: "project = DEV",
+      teamMembers: ["ada@example.test", "grace@example.test"],
+      theme: "Dark",
+      noColor: true,
+      asciiOnly: true,
+    });
+    backend.close();
+  });
+
+  test("maps invalid and unsafe preference failures without exposing storage details", () => {
+    const invalidDir = `/tmp/jira-desk-preferences-invalid-${crypto.randomUUID()}`;
+    const unsafeDir = `/tmp/jira-desk-preferences-unsafe-${crypto.randomUUID()}`;
+    dirs.push(invalidDir, unsafeDir);
+    mkdirSync(invalidDir, { recursive: true });
+    mkdirSync(unsafeDir, { recursive: true });
+    const invalidEnv = { XDG_DATA_HOME: invalidDir };
+    const invalid = new JiraDeskBackend({ env: invalidEnv, cache: new IssueCache(join(invalidDir, "cache.sqlite3")), preferences: new PreferencesStore(invalidEnv) });
+    expect(() => invalid.saveAppearancePreferences({ theme: "Nope" as "System", noColor: false, asciiOnly: false })).toThrow(
+      expect.objectContaining({ category: "invalid_input", message: "Preferences are invalid" }),
+    );
+    invalid.close();
+
+    const preferencesDir = join(unsafeDir, "jira-desk");
+    mkdirSync(preferencesDir, { recursive: true });
+    const target = join(unsafeDir, "outside-preferences.json");
+    symlinkSync(target, join(preferencesDir, "preferences.json"));
+    const unsafeEnv = { XDG_DATA_HOME: unsafeDir };
+    const unsafe = new JiraDeskBackend({ env: unsafeEnv, cache: new IssueCache(join(unsafeDir, "cache.sqlite3")), preferences: new PreferencesStore(unsafeEnv) });
+    expect(() => unsafe.saveAppearancePreferences({ theme: "Dark", noColor: false, asciiOnly: false })).toThrow(
+      expect.objectContaining({ category: "storage", message: "Unable to access local preferences" }),
+    );
+    try {
+      unsafe.saveAppearancePreferences({ theme: "Dark", noColor: false, asciiOnly: false });
+    } catch (error) {
+      expect(String(error)).not.toContain(target);
+    }
+    unsafe.close();
+  });
+
+  test("does not affect the current Jira workspace", async () => {
+    const fixtureData = fixture();
+    const dir = `/tmp/jira-desk-preferences-workspace-${crypto.randomUUID()}`;
+    dirs.push(dir);
+    mkdirSync(dir, { recursive: true });
+    const env = { XDG_DATA_HOME: dir };
+    const backend = new JiraDeskBackend({ env, cache: fixtureData.cache, preferences: new PreferencesStore(env), jiraFactory: () => fixtureData.jira });
+    const connected = await backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
+    backend.saveAppearancePreferences({ theme: "Light", noColor: true, asciiOnly: false });
+    const refreshed = await backend.refresh();
+    expect(refreshed.issues).toEqual(connected.issues);
+    expect(refreshed.identity).toBe(connected.identity);
+    backend.close();
+  });
+
   test("connects through a Jira port, returns domain snapshots, and never returns credentials", async () => {
     const fixtureData = fixture();
     const credentialStore = { async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; }, async save() { return { kind: "ok", value: true } as const; }, async delete() { return { kind: "ok", value: true } as const; } } as unknown as SystemCredentialStore;
