@@ -51,6 +51,46 @@ export function scopePartitionSiteId(siteId: string, scope?: string): string {
   return `scope-v1:${digest}`;
 }
 
+/**
+ * Derive an opaque cache identity for a stable set of team members.
+ *
+ * Team partitions are always explicit, including an empty team. This keeps
+ * them isolated from both the historical primary site identity and scoped
+ * partitions while allowing the member list to be safely represented only by
+ * a digest.
+ */
+export function teamPartitionSiteId(siteId: string, accountIds: readonly string[]): string {
+  if (typeof siteId !== "string" || !validCacheIdentityValue(siteId) || !Array.isArray(accountIds) || accountIds.length > 100) {
+    throw new StorageError("invalid_identity", "Invalid team cache identity");
+  }
+
+  const normalizedMembers: string[] = [];
+  for (const accountId of accountIds) {
+    if (
+      typeof accountId !== "string"
+      || [...accountId].some((char) => /\p{Cc}/u.test(char))
+      || accountId.includes('"')
+      || accountId.includes("\\")
+    ) {
+      throw new StorageError("invalid_identity", "Invalid team cache identity");
+    }
+    const normalized = accountId.trim();
+    if (normalized.length === 0 || new TextEncoder().encode(normalized).byteLength > 256) {
+      throw new StorageError("invalid_identity", "Invalid team cache identity");
+    }
+    normalizedMembers.push(normalized);
+  }
+
+  const members = [...new Set(normalizedMembers)].sort();
+  const digest = createHash("sha256")
+    .update("jira-desk-team-v1\0", "utf8")
+    .update(siteId.trim(), "utf8")
+    .update("\0", "utf8")
+    .update(members.join("\0"), "utf8")
+    .digest("hex");
+  return `team-v1:${digest}`;
+}
+
 /** Resolve the app directory without ever accepting a relative root. */
 export function resolveDataDirectory(env: Record<string, string | undefined> = process.env): string {
   const root = env.XDG_DATA_HOME?.trim() || (env.HOME ? join(env.HOME, ".local", "share") : "");

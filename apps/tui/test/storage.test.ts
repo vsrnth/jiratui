@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { ensureDataDirectory, IssueCache, MAX_CACHED_ISSUES, scopePartitionSiteId, StorageError, validateCacheIdentity } from "../src/storage/cache";
+import { ensureDataDirectory, IssueCache, MAX_CACHED_ISSUES, scopePartitionSiteId, StorageError, teamPartitionSiteId, validateCacheIdentity } from "../src/storage/cache";
 import { SystemCredentialStore, type SecretProvider } from "../src/storage/credentials";
 import type { IssueSummary } from "../src/domain";
 import { applyUpdateSnapshot, emptyUpdateLedger, markGroupsRead, setGroupExpanded, type UpdateEvent } from "../src/updates/ledger";
@@ -209,6 +209,50 @@ describe("scopePartitionSiteId", () => {
   test("rejects an unsafe base site identity", () => {
     expect(() => scopePartitionSiteId("site-\u0000-a", "project = DEV")).toThrow(StorageError);
     expect(() => scopePartitionSiteId("x".repeat(321), "project = DEV")).toThrow(StorageError);
+  });
+});
+
+describe("teamPartitionSiteId", () => {
+  test("keeps even an empty team separate from primary and scope partitions", () => {
+    const emptyTeam = teamPartitionSiteId("site-a", []);
+    expect(emptyTeam).toMatch(/^team-v1:[0-9a-f]{64}$/);
+    expect(emptyTeam).not.toBe("site-a");
+    expect(emptyTeam).not.toBe(scopePartitionSiteId("site-a"));
+    expect(emptyTeam).not.toBe(scopePartitionSiteId("site-a", "project = DEV"));
+  });
+
+  test("normalizes, deduplicates, and sorts members before hashing", () => {
+    const first = teamPartitionSiteId("  site-a  ", [" acct-b ", "acct-a", "acct-b", "acct-a"]);
+    expect(first).toBe(teamPartitionSiteId("site-a", ["acct-a", "acct-b"]));
+    expect(first).toBe(teamPartitionSiteId("site-a", ["acct-b", "acct-a"]));
+  });
+
+  test("separates distinct member sets and sites", () => {
+    const first = teamPartitionSiteId("site-a", ["acct-a"]);
+    expect(first).not.toBe(teamPartitionSiteId("site-a", ["acct-b"]));
+    expect(first).not.toBe(teamPartitionSiteId("site-b", ["acct-a"]));
+  });
+
+  test("returns a bounded opaque identity without raw values or path separators", () => {
+    const site = "tenant.example.test";
+    const member = "member@example.test";
+    const partition = teamPartitionSiteId(site, [member]);
+    expect(partition).toMatch(/^team-v1:[0-9a-f]{64}$/);
+    expect(partition.length).toBeLessThanOrEqual(320);
+    expect(partition).not.toContain(site);
+    expect(partition).not.toContain(member);
+    expect(partition).not.toMatch(/[\\/]/u);
+  });
+
+  test("rejects oversized, unsafe, and invalid team identities", () => {
+    expect(() => teamPartitionSiteId("site-a", Array.from({ length: 101 }, (_, index) => `acct-${index}`))).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("site-a", [" "])).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("site-a", ["x".repeat(257)])).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("site-a", ["acct\u0000a"])).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("site-a", ['acct"a'])).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("site-a", ["acct\\a"])).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("site-\u0000-a", [])).toThrow(StorageError);
+    expect(() => teamPartitionSiteId("x".repeat(321), [])).toThrow(StorageError);
   });
 });
 
