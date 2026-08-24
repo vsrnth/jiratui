@@ -62,6 +62,7 @@ export async function run(): Promise<void> {
       if (key.ctrl && key.name === "c") { quit(); return true; }
       const result = handleKey(state, key);
       state = result.state; dirty = true; draw();
+      if (result.command === "persist_updates") { persistUpdates(); return true; }
       if (result.command === "quit") { quit(); return true; }
       if (result.command === "cancel_connect") { connectController?.abort(); connectController = null; return true; }
       if (result.command === "retry_resize") { dispatch({ type: "resize", size: { width: renderer?.width ?? 1, height: renderer?.height ?? 1 } }); return true; }
@@ -97,7 +98,7 @@ export async function run(): Promise<void> {
     if (bootstrap.state === "authenticated") {
       const snapshot = bootstrap.snapshot;
       dispatch({ type: "authenticated", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity) });
-      dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation: state.generations.refresh });
+      dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation: state.generations.refresh, updates: snapshot.updates, updatesBaselineEstablished: snapshot.updatesBaselineEstablished });
       if (snapshot.warning) dispatch({ type: "message", message: snapshot.warning, kind: "warning" });
       if (snapshot.source === "cache") {
         dispatch({ type: "refresh_start" });
@@ -141,7 +142,7 @@ export async function run(): Promise<void> {
       if (!isCurrent()) return;
       dispatch({ type: "authenticated", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), generation });
       if (!isCurrent()) return;
-      dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation: state.generations.refresh });
+      dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation: state.generations.refresh, updates: snapshot.updates, updatesBaselineEstablished: snapshot.updatesBaselineEstablished });
       if (snapshot.warning) dispatch({ type: "message", message: snapshot.warning, kind: "warning" });
       if (snapshot.source === "cache") {
         dispatch({ type: "refresh_start" });
@@ -165,7 +166,7 @@ export async function run(): Promise<void> {
     try {
       const snapshot = await backend.refresh(controller.signal);
       if (quitting || controller.signal.aborted) return;
-      dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation });
+      dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation, updates: snapshot.updates, updatesBaselineEstablished: snapshot.updatesBaselineEstablished });
       pollingFailures = 0;
       schedulePoll();
     } catch (error) {
@@ -220,6 +221,16 @@ export async function run(): Promise<void> {
       dispatch({ type: "message", message: "Saved login removed; the current session remains connected", kind: "success" });
     } catch (error) {
       dispatch({ type: "message", message: error instanceof Error ? error.message : "Saved login could not be removed", kind: "error" });
+    }
+  }
+
+  function persistUpdates(): void {
+    const ledger = state.updates;
+    try {
+      dispatch({ type: "updates_persisted", updates: backend.persistUpdateLedger(ledger) });
+    } catch (error) {
+      const detail = error instanceof BackendError ? error.message.slice(0, 240) : "";
+      dispatch({ type: "message", message: detail ? `Updates could not be saved: ${detail}` : "Updates could not be saved; changes remain local", kind: "warning" });
     }
   }
 }

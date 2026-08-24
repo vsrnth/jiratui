@@ -5,6 +5,7 @@ import { IssueCache } from "../src/storage/cache";
 import { JiraDeskBackend, Workspace } from "../src/backend";
 import { SystemCredentialStore, type CredentialResult, type SavedCredentials, type SecretProvider } from "../src/storage/credentials";
 import type { IssueDetail, IssueSummary } from "../src/domain";
+import { emptyUpdateLedger, markGroupsRead } from "../src/updates/ledger";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -33,6 +34,86 @@ describe("Workspace", () => {
     const workspace = await Workspace.connect(fixtureData.jira, fixtureData.cache, { siteId: "site-1" });
     expect(workspace.detail("DEV-1")).rejects.toMatchObject({ code: "not_found" });
     expect(await workspace.detail("DEV-1", true)).toEqual(detail);
+  });
+
+  test("quietly establishes the first baseline, then persists a derived diff", async () => {
+    const fixtureData = fixture();
+    let current = summary;
+    const jira = {
+      async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+      async searchAssignedOrWatched() { return [current]; },
+      async issueDetail() { return detail; },
+    };
+    const workspace = await Workspace.connect(jira, fixtureData.cache, { siteId: "site-1" });
+    const first = await workspace.refresh();
+    expect(first.updates.events).toEqual([]);
+    expect(first.updatesBaselineEstablished).toBe(true);
+
+    current = { ...summary, summary: "Changed", updated: "2026-02-01" };
+    const second = await workspace.refresh();
+    expect(second.updates.events).toHaveLength(1);
+    const read = markGroupsRead(second.updates, [summary.id], true, [summary.id]);
+    const persisted = workspace.persistUpdateLedger(read);
+    expect(persisted.readIssueIds).toEqual([summary.id]);
+  });
+
+  test("loads the workspace only during connect; refresh uses the atomic commit result", async () => {
+    const fixtureData = fixture();
+    const originalLoad = fixtureData.cache.loadWorkspace.bind(fixtureData.cache);
+    let loads = 0;
+    fixtureData.cache.loadWorkspace = ((identity) => {
+      loads += 1;
+      return originalLoad(identity);
+    }) as typeof fixtureData.cache.loadWorkspace;
+    try {
+      const workspace = await Workspace.connect(fixtureData.jira, fixtureData.cache, { siteId: "site-1" });
+      expect(loads).toBe(1);
+      await workspace.refresh();
+      expect(loads).toBe(1);
+    } finally {
+      fixtureData.cache.loadWorkspace = originalLoad;
+    }
+  });
+
+  test("does not mutate the workspace when atomic refresh persistence fails", async () => {
+    const fixtureData = fixture();
+    fixtureData.cache.replace({ siteId: "site-1", accountId: "acct-1" }, [summary]);
+    const workspace = await Workspace.connect(fixtureData.jira, fixtureData.cache, { siteId: "site-1" });
+    const before = workspace.initialSnapshot();
+    const cache = fixtureData.cache as IssueCache & { commitWorkspace: IssueCache["commitWorkspace"] };
+    const originalCommit = cache.commitWorkspace;
+    cache.commitWorkspace = (() => { throw new Error("atomic commit failed"); }) as typeof originalCommit;
+    try {
+      await expect(workspace.refresh()).rejects.toMatchObject({ code: "storage" });
+    } finally {
+      cache.commitWorkspace = originalCommit;
+    }
+    const after = workspace.initialSnapshot();
+    expect(after.issues).toEqual(before.issues);
+    expect(after.updates).toEqual(before.updates);
+    expect(after.updatesBaselineEstablished).toBe(before.updatesBaselineEstablished);
+  });
+
+  test("leaves the workspace unchanged when Jira refresh fails", async () => {
+    const fixtureData = fixture();
+    let fail = false;
+    const jira = {
+      async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+      async searchAssignedOrWatched() {
+        if (fail) throw new Error("offline");
+        return [summary];
+      },
+      async issueDetail() { return detail; },
+    };
+    const workspace = await Workspace.connect(jira, fixtureData.cache, { siteId: "site-1" });
+    await workspace.refresh();
+    const before = workspace.initialSnapshot();
+    fail = true;
+    await expect(workspace.refresh()).rejects.toMatchObject({ code: "transport" });
+    const after = workspace.initialSnapshot();
+    expect(after.issues).toEqual(before.issues);
+    expect(after.updates).toEqual(before.updates);
+    expect(after.updatesBaselineEstablished).toBe(before.updatesBaselineEstablished);
   });
 });
 
@@ -92,6 +173,47 @@ describe("JiraDeskBackend", () => {
     expect(restored.snapshot.issues[0]?.key as string | undefined).toBe("DEV-1");
     expect(JSON.stringify(restored.snapshot)).not.toContain("secret-token");
     second.close();
+  });
+
+  test("restores persisted update events and read state across backend sessions", async () => {
+    const dir = `/tmp/jira-desk-updates-${crypto.randomUUID()}`;
+    dirs.push(dir);
+    mkdirSync(dir, { recursive: true });
+    const databasePath = join(dir, "jira-desk.sqlite3");
+    let current = summary;
+    const jira = {
+      async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+      async searchAssignedOrWatched() { return [current]; },
+      async issueDetail() { return detail; },
+    };
+    const credentials = {
+      async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; },
+      async save() { return { kind: "ok", value: true } as const; },
+      async delete() { return { kind: "ok", value: true } as const; },
+    } as unknown as SystemCredentialStore;
+    const first = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, jiraFactory: () => jira });
+    await first.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
+    current = { ...summary, summary: "Changed", updated: "2026-02-01" };
+    const changed = await first.refresh();
+    const read = markGroupsRead(changed.updates, [summary.id], true, [summary.id]);
+    first.persistUpdateLedger(read);
+    first.close();
+
+    const second = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, jiraFactory: () => jira });
+    const restored = await second.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
+    expect(restored.source).toBe("cache");
+    expect(restored.updates.events).toHaveLength(1);
+    expect(restored.updates.readIssueIds).toEqual([summary.id]);
+    second.close();
+  });
+
+  test("requires authentication to persist local updates", () => {
+    const fixtureData = fixture();
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, jiraFactory: () => fixtureData.jira });
+    expect(() => backend.persistUpdateLedger(emptyUpdateLedger())).toThrow(
+      expect.objectContaining({ category: "authentication" }),
+    );
+    backend.close();
   });
 
   test("rejects a partial environment tuple safely", async () => {

@@ -2,6 +2,20 @@ import { describe, expect, test } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { handleKey, parseSequence } from "../src/input";
 import { initialState, reduce } from "../src/state";
+import type { IssueSummary } from "../src/domain";
+import { applyUpdateSnapshot, emptyUpdateLedger, type UpdateLedger } from "../src/updates/ledger";
+
+const workspaceSnapshot = (issues: readonly IssueSummary[], options: { source?: "cache" | "jira"; refreshedAt?: string; updates?: UpdateLedger; updatesBaselineEstablished?: boolean } = {}) => ({
+  type: "workspace_snapshot" as const,
+  siteLabel: "site",
+  identity: "user",
+  issues,
+  source: options.source ?? "cache",
+  refreshedAt: options.refreshedAt ?? "now",
+  generation: 0,
+  updates: options.updates ?? emptyUpdateLedger(),
+  updatesBaselineEstablished: options.updatesBaselineEstablished ?? false,
+});
 
 describe("key handling", () => {
   test("uses explicit focus traversal and escape unwinds help", () => {
@@ -97,7 +111,7 @@ describe("key handling", () => {
   });
   test("opens the status picker with s and applies on OpenTUI return", () => {
     const issues = [{ id: "1" as never, key: "ABC-1" as never, summary: "Progress", status: "In Progress", statusCategory: "in_progress" as const, priority: "Medium", assignee: "Ada", updated: "now" }];
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    let state = reduce(initialState(), workspaceSnapshot(issues));
     state = { ...state, phase: "ready", focus: "List" };
     let result = handleKey(state, { name: "s", sequence: "s" });
     expect(result.state.pickerMode).toBe("status");
@@ -124,16 +138,21 @@ describe("key handling", () => {
   test("keeps Updates controls local and opens the selected issue on Enter", () => {
     let state = initialState();
     const issue = { id: "1" as never, key: "ABC-1" as never, summary: "Original", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "2026-08-23T00:00:00Z" };
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issue], source: "cache", refreshedAt: "initial", generation: 0 });
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [{ ...issue, summary: "Changed", updated: "2026-08-24T00:00:00Z" }], source: "jira", refreshedAt: "later", generation: 0 });
+    state = reduce(state, workspaceSnapshot([issue], { refreshedAt: "initial", updatesBaselineEstablished: true }));
+    const changed = { ...issue, summary: "Changed", updated: "2026-08-24T00:00:00Z" };
+    state = reduce(state, workspaceSnapshot([changed], { source: "jira", refreshedAt: "later", updates: applyUpdateSnapshot(emptyUpdateLedger(), [issue as never], [changed as never]), updatesBaselineEstablished: true }));
     state = reduce(state, { type: "set_section", section: "updates" });
     expect(handleKey(state, { name: "r", sequence: "r" }).state.lastMessage).toBe("Local updates are already current");
     expect(handleKey(state, { name: "r", sequence: "r" }).command).toBeNull();
-    const expanded = handleKey(state, { name: "space", sequence: " " }).state;
+    const expandedResult = handleKey(state, { name: "space", sequence: " " });
+    expect(expandedResult.command).toBe("persist_updates");
+    const expanded = expandedResult.state;
     expect(expanded.updates.expandedIssueIds).toHaveLength(1);
     const all = handleKey(expanded, { name: "u", sequence: "u" }).state;
     expect(all.updateFilter).toBe("all");
-    const toggled = handleKey(all, { name: "m", sequence: "m" }).state;
+    const toggledResult = handleKey(all, { name: "m", sequence: "m" });
+    expect(toggledResult.command).toBe("persist_updates");
+    const toggled = toggledResult.state;
     expect(toggled.updates.readIssueIds).toHaveLength(1);
     const selected = handleKey(toggled, { name: "enter", sequence: "\r" });
     expect(selected.command).toBe("detail");
@@ -144,13 +163,17 @@ describe("key handling", () => {
     const issue = (id: string, key: string) => ({ id: id as never, key: key as never, summary: key, status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "2026-08-23T00:00:00Z" });
     const first = issue("1", "ABC-1");
     const second = issue("2", "ABC-2");
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [first, second], source: "cache", refreshedAt: "initial", generation: 0 });
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [{ ...first, summary: "Changed", updated: "2026-08-24T00:00:00Z" }, { ...second, summary: "Changed", updated: "2026-08-24T00:01:00Z" }], source: "jira", refreshedAt: "later", generation: 0 });
+    let state = reduce(initialState(), workspaceSnapshot([first, second], { refreshedAt: "initial", updatesBaselineEstablished: true }));
+    const changedFirst = { ...first, summary: "Changed", updated: "2026-08-24T00:00:00Z" };
+    const changedSecond = { ...second, summary: "Changed", updated: "2026-08-24T00:01:00Z" };
+    state = reduce(state, workspaceSnapshot([changedFirst, changedSecond], { source: "jira", refreshedAt: "later", updates: applyUpdateSnapshot(emptyUpdateLedger(), [first as never, second as never], [changedFirst as never, changedSecond as never]), updatesBaselineEstablished: true }));
     state = reduce(state, { type: "set_section", section: "updates" });
     const prompted = handleKey(state, { name: "M", sequence: "M", shift: true });
     expect(prompted.state.confirmMarkAllUpdates).toBe(true);
     expect(handleKey(prompted.state, { name: "n", sequence: "n" }).state.confirmMarkAllUpdates).toBe(false);
-    const confirmed = handleKey(prompted.state, { name: "y", sequence: "y" }).state;
+    const confirmedResult = handleKey(prompted.state, { name: "y", sequence: "y" });
+    expect(confirmedResult.command).toBe("persist_updates");
+    const confirmed = confirmedResult.state;
     expect(confirmed.confirmMarkAllUpdates).toBe(false);
     expect(confirmed.updates.readIssueIds).toHaveLength(2);
   });
@@ -158,9 +181,11 @@ describe("key handling", () => {
     const issue = (id: string, key: string) => ({ id: id as never, key: key as never, summary: key, status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "2026-08-23T00:00:00Z" });
     const first = issue("1", "ABC-1");
     const second = issue("2", "ABC-2");
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [first, second], source: "cache", refreshedAt: "initial", generation: 0 });
+    let state = reduce(initialState(), workspaceSnapshot([first, second], { refreshedAt: "initial", updatesBaselineEstablished: true }));
     state = reduce(state, { type: "select_issue", index: 1 });
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [{ ...first, summary: "Changed first", updated: "2026-08-24T00:01:00Z" }, { ...second, summary: "Changed second", updated: "2026-08-24T00:02:00Z" }], source: "jira", refreshedAt: "later", generation: 0 });
+    const changedFirst = { ...first, summary: "Changed first", updated: "2026-08-24T00:01:00Z" };
+    const changedSecond = { ...second, summary: "Changed second", updated: "2026-08-24T00:02:00Z" };
+    state = reduce(state, workspaceSnapshot([changedFirst, changedSecond], { source: "jira", refreshedAt: "later", updates: applyUpdateSnapshot(emptyUpdateLedger(), [first as never, second as never], [changedFirst as never, changedSecond as never]), updatesBaselineEstablished: true }));
     state = reduce(state, { type: "set_section", section: "updates" });
     const issueIndex = state.selectedIndex;
     const issueKey = state.selectedIssueKey;
@@ -170,5 +195,29 @@ describe("key handling", () => {
     expect(moved.selectedIssueKey).toBe(issueKey);
     const activated = handleKey(moved, { name: "enter", sequence: "\r" }).state;
     expect(activated.selectedIssueKey).toBe("ABC-1");
+  });
+
+  test("does not request persistence for navigation, filtering, refresh, or no-op update controls", () => {
+    const state = { ...initialState(), phase: "ready" as const, section: "updates" as const };
+    expect(handleKey(state, { name: "j", sequence: "j" }).command).toBeNull();
+    expect(handleKey(state, { name: "u", sequence: "u" }).command).toBeNull();
+    expect(handleKey(state, { name: "r", sequence: "r" }).command).toBeNull();
+    expect(handleKey(state, { name: "m", sequence: "m" }).command).toBeNull();
+    expect(handleKey(state, { name: "space", sequence: " " }).command).toBeNull();
+    expect(handleKey(state, { name: "M", sequence: "M", shift: true }).command).toBeNull();
+  });
+
+  test("adopting canonical persistence keeps selection and applied issue filter", () => {
+    const issue = { id: "1" as never, key: "ABC-1" as never, summary: "Original", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "2026-08-23T00:00:00Z" };
+    let state = reduce(initialState(), workspaceSnapshot([issue], { updatesBaselineEstablished: true }));
+    state = reduce(state, { type: "set_search", value: "ABC-1" });
+    state = reduce(state, { type: "set_section", section: "updates" });
+    const selectedKey = state.selectedIssueKey;
+    const canonical = { events: state.updates.events, readIssueIds: [issue.id], expandedIssueIds: [] };
+    state = reduce(state, { type: "updates_persisted", updates: canonical });
+    expect(state.selectedIssueKey).toBe(selectedKey);
+    expect(state.search).toBe("ABC-1");
+    expect(state.filteredIssues).toHaveLength(1);
+    expect(state.updates.readIssueIds).toEqual([issue.id]);
   });
 });

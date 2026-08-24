@@ -3,6 +3,7 @@ import { createTestRenderer } from "@opentui/core/testing";
 import { parseIssueId, parseIssueKey, type IssueDetail, type IssueSummary } from "../src/domain";
 import { renderApp } from "../src/render/app";
 import { initialState, reduce, visibleUpdateGroups } from "../src/state";
+import { applyUpdateSnapshot, emptyUpdateLedger } from "../src/updates/ledger";
 
 const longKey = parseIssueKey("EXTRAORDINARILY_LONG_PROJECT_KEY-123456789");
 const issue: IssueSummary = {
@@ -30,19 +31,23 @@ const detail: IssueDetail = {
   remote: false,
 };
 
+const workspaceSnapshot = (issues: readonly IssueSummary[], options: { source?: "cache" | "jira"; refreshedAt?: string; updates?: ReturnType<typeof emptyUpdateLedger>; updatesBaselineEstablished?: boolean } = {}) => ({
+  type: "workspace_snapshot" as const,
+  siteLabel: "site",
+  identity: "user",
+  issues,
+  source: options.source ?? "cache",
+  refreshedAt: options.refreshedAt ?? "now",
+  generation: 0,
+  updates: options.updates ?? emptyUpdateLedger(),
+  updatesBaselineEstablished: options.updatesBaselineEstablished ?? false,
+});
+
 async function frameAt(width: number, height: number, withDetail = false, detailValue = detail): Promise<string> {
   const setup = await createTestRenderer({ width, height });
   try {
     let state = initialState({ width, height });
-    state = reduce(state, {
-      type: "workspace_snapshot",
-      siteLabel: "example.atlassian.net",
-      identity: "Ada",
-      issues: [issue],
-      source: "cache",
-      refreshedAt: "now",
-      generation: 0,
-    });
+    state = reduce(state, workspaceSnapshot([issue]));
     if (withDetail) {
       state = reduce(state, { type: "detail_start", issueKey: longKey });
       state = reduce(state, { type: "detail_result", issueKey: longKey, issue: detailValue, generation: 1 });
@@ -107,7 +112,7 @@ describe("OpenTUI frames", () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {
       let state = initialState({ width: 120, height: 40 });
-      state = reduce(state, { type: "workspace_snapshot", siteLabel: "example.atlassian.net", identity: "Ada", issues: [issue], source: "cache", refreshedAt: "now", generation: 0 });
+      state = reduce(state, workspaceSnapshot([issue]));
       state = reduce(state, { type: "open_status_picker" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();
@@ -133,15 +138,7 @@ describe("OpenTUI frames", () => {
   test("does not accumulate selection listeners across repeated redraws", async () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {
-      const state = reduce(initialState({ width: 120, height: 40 }), {
-        type: "workspace_snapshot",
-        siteLabel: "example.atlassian.net",
-        identity: "Ada",
-        issues: [issue],
-        source: "cache",
-        refreshedAt: "now",
-        generation: 0,
-      });
+      const state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue]));
       renderApp(setup.renderer, state);
       await setup.renderOnce();
       const firstListenerCount = setup.renderer.listenerCount("selection");
@@ -162,8 +159,8 @@ describe("OpenTUI frames", () => {
     try {
       const base = { ...issue, summary: "Original summary", status: "Open", statusCategory: "to_do" as const, priority: "Low", assignee: "Ada", updated: "2026-08-23T00:00:00Z" };
       const changed = { ...base, summary: "Changed summary", status: "Done", statusCategory: "done" as const, priority: "High", assignee: "Bea", updated: "2026-08-24T01:02:03+05:30" };
-      let state = reduce(initialState({ width: 140, height: 48 }), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [base], source: "cache", refreshedAt: "initial", generation: 0 });
-      state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [changed], source: "jira", refreshedAt: "later", generation: 0 });
+      let state = reduce(initialState({ width: 140, height: 48 }), workspaceSnapshot([base], { refreshedAt: "initial", updatesBaselineEstablished: true }));
+      state = reduce(state, workspaceSnapshot([changed], { source: "jira", refreshedAt: "later", updates: applyUpdateSnapshot(emptyUpdateLedger(), [base], [changed]), updatesBaselineEstablished: true }));
       state = reduce(state, { type: "set_section", section: "updates" });
       expect(visibleUpdateGroups(state)[0]?.rows).toHaveLength(3);
       renderApp(setup.renderer, state);
@@ -176,7 +173,7 @@ describe("OpenTUI frames", () => {
       expect(frame).toContain("… 1 more");
 
       const newIssue = { ...issue, id: parseIssueId("10002"), key: parseIssueKey("OTHER-987654321"), summary: "Newly visible issue", updated: "2026-08-24T02:00:00Z" };
-      state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [changed, newIssue], source: "jira", refreshedAt: "later-2", generation: 0 });
+      state = reduce(state, workspaceSnapshot([changed, newIssue], { source: "jira", refreshedAt: "later-2", updates: applyUpdateSnapshot(applyUpdateSnapshot(emptyUpdateLedger(), [base], [changed]), [changed], [changed, newIssue]), updatesBaselineEstablished: true }));
       state = reduce(state, { type: "set_section", section: "updates" });
       renderApp(setup.renderer, state);
       await setup.renderOnce();

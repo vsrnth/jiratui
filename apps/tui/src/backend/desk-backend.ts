@@ -5,9 +5,19 @@ import { SystemCredentialStore, type CredentialParts } from "../storage/credenti
 import { Workspace, WorkspaceError, type WorkspaceSnapshot } from "./workspace";
 import type { JiraReadPort } from "./ports";
 import type { IssueDetail, IssueSummary } from "../domain";
+import type { UpdateLedger } from "../updates/ledger";
 
 export type BackendCredentials = Readonly<{ baseUrl: string; email: string; token: string; remember: boolean; cloudId?: string; siteId?: string }>;
-export type BackendSnapshot = Readonly<{ siteLabel: string; identity: string; issues: readonly IssueSummary[]; source: "cache" | "jira"; refreshedAt: string; warning?: string }>;
+export type BackendSnapshot = Readonly<{
+  siteLabel: string;
+  identity: string;
+  issues: readonly IssueSummary[];
+  updates: UpdateLedger;
+  updatesBaselineEstablished: boolean;
+  source: "cache" | "jira";
+  refreshedAt: string;
+  warning?: string;
+}>;
 export type BackendBootstrap = { state: "onboarding_required"; warning?: string } | { state: "authenticated"; snapshot: BackendSnapshot };
 export type BackendFailureCategory = JiraErrorCategory | "storage" | "internal";
 
@@ -91,7 +101,15 @@ export class JiraDeskBackend {
 
   async refresh(signal?: AbortSignal): Promise<BackendSnapshot> {
     if (!this.#workspace) throw new BackendError("authentication", "Connect to Jira first");
-    try { return toBackendSnapshot(await this.#workspace.refresh(undefined, signal)); } catch (error) { throw mapWorkspaceError(error); }
+    try { return toBackendSnapshot(await this.#workspace.refresh(undefined, signal)); } catch (error) {
+      if (signal?.aborted) throw cancelledError();
+      throw mapWorkspaceError(error);
+    }
+  }
+
+  persistUpdateLedger(ledger: UpdateLedger): UpdateLedger {
+    if (!this.#workspace) throw new BackendError("authentication", "Connect to Jira first");
+    try { return this.#workspace.persistUpdateLedger(ledger); } catch (error) { throw mapWorkspaceError(error); }
   }
 
   async loadDetail(issueKey: string, remote = false, signal?: AbortSignal): Promise<IssueDetail> {
@@ -119,7 +137,15 @@ export class JiraDeskBackend {
 }
 
 function toBackendSnapshot(snapshot: WorkspaceSnapshot): BackendSnapshot {
-  return { siteLabel: snapshot.siteLabel, identity: snapshot.identity.displayName, issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt };
+  return {
+    siteLabel: snapshot.siteLabel,
+    identity: snapshot.identity.displayName,
+    issues: snapshot.issues,
+    updates: snapshot.updates,
+    updatesBaselineEstablished: snapshot.updatesBaselineEstablished,
+    source: snapshot.source,
+    refreshedAt: snapshot.refreshedAt,
+  };
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

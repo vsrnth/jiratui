@@ -1,7 +1,7 @@
 import { clampIndex, layoutFor, type Layout, type LayoutMode, type TerminalSize } from "./layout";
 import { backspaceSecret, emptySecret, type SecretEditor } from "./secure-input";
 import type { IssueDetail, IssueSummary, StatusCategory } from "./protocol";
-import { applyUpdateSnapshot, emptyUpdateLedger, markAllDisplayedRead, setGroupExpanded, toggleGroupRead, updateGroups, type UpdateFilter, type UpdateGroup, type UpdateLedger } from "./updates/ledger";
+import { emptyUpdateLedger, markAllDisplayedRead, setGroupExpanded, toggleGroupRead, updateGroups, type UpdateFilter, type UpdateGroup, type UpdateLedger } from "./updates/ledger";
 import type { IssueId } from "./domain";
 
 export type Focus = "Nav" | "Search" | "List" | "Detail" | "Composer" | "Picker" | "Settings" | "Help" | "EventLog";
@@ -98,7 +98,8 @@ export type Action =
   | { type: "onboarding_cancel" }
   | { type: "onboarding_error"; message: string; generation?: number }
   | { type: "authenticated"; siteLabel: string; identity: string; generation?: number }
-  | { type: "workspace_snapshot"; siteLabel: string; identity: string; issues: readonly IssueSummary[]; source: "cache" | "jira"; refreshedAt: string; generation: number }
+  | { type: "workspace_snapshot"; siteLabel: string; identity: string; issues: readonly IssueSummary[]; source: "cache" | "jira"; refreshedAt: string; generation: number; updates: UpdateLedger; updatesBaselineEstablished: boolean }
+  | { type: "updates_persisted"; updates: UpdateLedger }
   | { type: "refresh_start" }
   | { type: "refresh_error"; message: string; generation: number }
   | { type: "detail_start"; issueKey: string }
@@ -223,9 +224,10 @@ export function reduce(state: RootState, action: Action): RootState {
     case "workspace_snapshot": {
       if (action.generation !== state.generations.refresh) return state;
       const filtered = filterIssues(action.issues, state.search, state.statusFilter);
-      const updates = applyUpdateSnapshot(state.updates, state.updatesBaselineEstablished ? state.issues : null, [...action.issues], { baseline: !state.updatesBaselineEstablished });
-      return withEvent(selectedUpdate(selectedIssue({ ...state, phase: "ready", siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt, updates, updatesBaselineEstablished: true, confirmMarkAllUpdates: false }, filtered), visibleUpdateGroups({ ...state, updates, updatesBaselineEstablished: true })), "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
+      const next = { ...state, phase: "ready" as const, siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt, updates: action.updates, updatesBaselineEstablished: action.updatesBaselineEstablished, confirmMarkAllUpdates: false };
+      return withEvent(selectedUpdate(selectedIssue(next, filtered), visibleUpdateGroups(next)), "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
     }
+    case "updates_persisted": return { ...state, updates: action.updates };
     case "refresh_start": return { ...state, refreshLoading: true, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_error": return action.generation === state.generations.refresh ? withEvent({ ...state, refreshLoading: false }, "refresh", action.message) : state;
     case "detail_start": return { ...state, detailLoading: true, detailError: null, selectedIssueKey: action.issueKey, detail: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };

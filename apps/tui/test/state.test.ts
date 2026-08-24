@@ -1,12 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import { initialState, reduce, visibleUpdateGroups } from "../src/state";
 import { parseIssueId, parseIssueKey } from "../src/domain";
+import { applyUpdateSnapshot, emptyUpdateLedger } from "../src/updates/ledger";
 
 const issues = [
   { id: parseIssueId("1"), key: parseIssueKey("ABC-123"), summary: "First issue", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "2026-08-23T00:00:00Z" },
   { id: parseIssueId("2"), key: parseIssueKey("ABC-456"), summary: "Second issue", status: "Done", statusCategory: "done" as const, priority: "Low", assignee: "Bea", updated: "2026-08-22T00:00:00Z" },
   { id: parseIssueId("3"), key: parseIssueKey("ABC-789"), summary: "Progress issue", status: "In Progress", statusCategory: "in_progress" as const, priority: "High", assignee: "Cy", updated: "2026-08-21T00:00:00Z" },
 ];
+
+const snapshot = (issuesValue: typeof issues, options: { source?: "cache" | "jira"; refreshedAt?: string; updates?: ReturnType<typeof emptyUpdateLedger>; updatesBaselineEstablished?: boolean } = {}) => ({
+  type: "workspace_snapshot" as const,
+  siteLabel: "site",
+  identity: "user",
+  issues: issuesValue,
+  source: options.source ?? "cache",
+  refreshedAt: options.refreshedAt ?? "now",
+  generation: 0,
+  updates: options.updates ?? emptyUpdateLedger(),
+  updatesBaselineEstablished: options.updatesBaselineEstablished ?? false,
+});
 
 describe("root reducer", () => {
   test("clears credentials on failure while retaining URL and email", () => {
@@ -52,13 +65,13 @@ describe("root reducer", () => {
 
   test("filters locally and preserves complete key", () => {
     let state = initialState();
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "example.atlassian.net", identity: "Ada", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    state = reduce(state, snapshot(issues));
     state = reduce(state, { type: "set_search", value: "456" });
     expect(state.filteredIssues.map((issue) => issue.key)).toEqual([parseIssueKey("ABC-456")]);
     expect(state.selectedIssueKey).toBe(parseIssueKey("ABC-456"));
   });
   test("applies status categories atomically and intersects local search", () => {
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    let state = reduce(initialState(), snapshot(issues));
     state = reduce(state, { type: "open_status_picker" });
     state = reduce(state, { type: "move_status_picker", delta: 1 });
     state = reduce(state, { type: "toggle_status_draft" });
@@ -71,7 +84,7 @@ describe("root reducer", () => {
     expect(state.filteredIssues).toEqual([]);
   });
   test("cancels a draft status selection without changing applied filters", () => {
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    let state = reduce(initialState(), snapshot(issues));
     state = reduce(state, { type: "open_status_picker" });
     state = reduce(state, { type: "move_status_picker", delta: 2 });
     state = reduce(state, { type: "toggle_status_draft" });
@@ -81,7 +94,7 @@ describe("root reducer", () => {
     expect(state.focus).toBe("List");
   });
   test("preserves the selected issue key when filtering changes its index", () => {
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    let state = reduce(initialState(), snapshot(issues));
     state = reduce(state, { type: "select_issue", index: 1 });
     state = reduce(state, { type: "open_status_picker" });
     state = reduce(state, { type: "move_status_picker", delta: 1 });
@@ -94,7 +107,7 @@ describe("root reducer", () => {
     expect(state.selectedIssueKey).toBe(parseIssueKey("ABC-456"));
   });
   test("clears incompatible detail state when search removes the selected issue", () => {
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    let state = reduce(initialState(), snapshot(issues));
     state = reduce(state, { type: "detail_start", issueKey: "ABC-123" });
     const pendingGeneration = state.generations.detail;
     state = { ...state, detailError: "old error" };
@@ -109,7 +122,7 @@ describe("root reducer", () => {
   });
   test("drops stale detail generations", () => {
     let state = initialState();
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "now", generation: 0 });
+    state = reduce(state, snapshot(issues));
     state = reduce(state, { type: "detail_start", issueKey: "ABC-123" });
     state = reduce(state, { type: "detail_result", issueKey: "ABC-123", generation: 0, issue: { issue: issues[0]!, issueType: "Task", reporter: "Ada", project: "ABC", parent: null, labels: [], dueDate: null, created: "2026-08-20", description: "old", comments: [], attachments: [], remote: false } });
     expect(state.detail).toBeNull();
@@ -118,27 +131,30 @@ describe("root reducer", () => {
   });
   test("ignores stale and future workspace snapshot generations", () => {
     let state = initialState();
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "initial", generation: 0 });
+    const canonical = { ...emptyUpdateLedger(), readIssueIds: [issues[0]!.id] };
+    state = reduce(state, snapshot(issues, { refreshedAt: "initial", updates: canonical, updatesBaselineEstablished: true }));
     state = reduce(state, { type: "refresh_start" });
     const current = state;
+    expect(current.updates).toEqual(canonical);
 
-    expect(reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issues[1]!], source: "jira", refreshedAt: "stale", generation: 0 })).toEqual(current);
-    expect(reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issues[1]!], source: "jira", refreshedAt: "future", generation: 2 })).toEqual(current);
+    expect(reduce(state, { ...snapshot([issues[1]!], { source: "jira", refreshedAt: "stale" }), generation: 0 })).toEqual(current);
+    expect(reduce(state, { ...snapshot([issues[1]!], { source: "jira", refreshedAt: "future" }), generation: 2 })).toEqual(current);
   });
-  test("establishes a quiet update baseline, then derives later field changes", () => {
+  test("adopts canonical update ledgers from workspace snapshots", () => {
     let state = initialState();
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "initial", generation: 0 });
+    state = reduce(state, snapshot(issues, { refreshedAt: "initial", updatesBaselineEstablished: true }));
     expect(state.updates.events).toHaveLength(0);
     expect(state.updatesBaselineEstablished).toBe(true);
 
     const changed = { ...issues[0]!, status: "Done", statusCategory: "done" as const, priority: "High", updated: "2026-08-24T01:00:00Z" };
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [changed, issues[1]!], source: "jira", refreshedAt: "later", generation: 0 });
+    const canonical = applyUpdateSnapshot(emptyUpdateLedger(), issues, [changed, issues[1]!]);
+    state = reduce(state, snapshot([changed, issues[1]!], { source: "jira", refreshedAt: "later", updates: canonical, updatesBaselineEstablished: true }));
     expect(state.updates.events.map((item) => item.field)).toEqual(["status", "priority"]);
     expect(visibleUpdateGroups(state)).toHaveLength(1);
     expect(visibleUpdateGroups(state)[0]?.issueKey).toBe(parseIssueKey("ABC-123"));
   });
   test("resets the issue and update view on a replacement authentication", () => {
-    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "old", identity: "old", issues, source: "cache", refreshedAt: "old", generation: 0 });
+    let state = reduce(initialState(), snapshot(issues, { refreshedAt: "old", updatesBaselineEstablished: true }));
     state = reduce(state, { type: "authenticated", siteLabel: "new", identity: "new", generation: state.generations.connect });
     expect(state.issues).toHaveLength(0);
     expect(state.detail).toBeNull();
@@ -147,8 +163,9 @@ describe("root reducer", () => {
   });
   test("supports update filter, read state, expansion, and confirmed mark-all", () => {
     let state = initialState();
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "initial", generation: 0 });
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: issues.map((issue, index) => index === 0 ? { ...issue, summary: "Changed", updated: "2026-08-24T01:00:00Z" } : issue), source: "jira", refreshedAt: "later", generation: 0 });
+    state = reduce(state, snapshot(issues, { refreshedAt: "initial", updatesBaselineEstablished: true }));
+    const changedIssues = issues.map((issue, index) => index === 0 ? { ...issue, summary: "Changed", updated: "2026-08-24T01:00:00Z" } : issue);
+    state = reduce(state, snapshot(changedIssues, { source: "jira", refreshedAt: "later", updates: applyUpdateSnapshot(emptyUpdateLedger(), issues, changedIssues), updatesBaselineEstablished: true }));
     expect(visibleUpdateGroups(state)).toHaveLength(1);
     state = reduce(state, { type: "toggle_update_expanded" });
     expect(visibleUpdateGroups(state)[0]?.expanded).toBe(true);
@@ -158,7 +175,8 @@ describe("root reducer", () => {
     expect(visibleUpdateGroups(state)[0]?.unread).toBe(false);
 
     const second = { ...issues[1]!, summary: "Changed too", updated: "2026-08-24T02:00:00Z" };
-    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issues[0]!, second], source: "jira", refreshedAt: "later-2", generation: 0 });
+    const secondIssues = [issues[0]!, second];
+    state = reduce(state, snapshot(secondIssues, { source: "jira", refreshedAt: "later-2", updates: applyUpdateSnapshot(state.updates, [changedIssues[0]!, issues[1]!], secondIssues), updatesBaselineEstablished: true }));
     state = reduce(state, { type: "request_mark_all_updates" });
     expect(state.confirmMarkAllUpdates).toBe(true);
     state = reduce(state, { type: "confirm_mark_all_updates", value: true });

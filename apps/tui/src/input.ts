@@ -2,7 +2,7 @@ import { backspaceSecret, deleteSecret, editSecret, moveSecret } from "./secure-
 import { reduce, type Action, type Focus, type RootState } from "./state";
 
 export type KeyLike = { name?: string; sequence?: string; ctrl?: boolean; shift?: boolean; meta?: boolean };
-export type InputCommand = "quit" | "connect" | "cancel_connect" | "refresh" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | null;
+export type InputCommand = "quit" | "connect" | "cancel_connect" | "refresh" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | "persist_updates" | null;
 export type InputResult = { state: RootState; command: InputCommand };
 const focusOrder: Focus[] = ["Nav", "Search", "List", "Detail", "Composer", "Picker", "Settings"];
 
@@ -18,6 +18,11 @@ export function keyName(key: KeyLike): string {
 function moveFocus(state: RootState, delta: number): RootState {
   const index = Math.max(0, focusOrder.indexOf(state.focus));
   return reduce(state, { type: "set_focus", focus: focusOrder[(index + delta + focusOrder.length) % focusOrder.length] ?? "List" });
+}
+
+function updateMutation(state: RootState, action: Action): InputResult {
+  const next = reduce(state, action);
+  return { state: next, command: next.updates !== state.updates ? "persist_updates" : null };
 }
 
 export function handleKey(state: RootState, key: KeyLike): InputResult {
@@ -94,7 +99,7 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     return { state, command: null };
   }
   if (state.confirmMarkAllUpdates) {
-    if (name === "y") return { state: reduce(state, { type: "confirm_mark_all_updates", value: true }), command: null };
+    if (name === "y") return updateMutation(state, { type: "confirm_mark_all_updates", value: true });
     if (name === "n" || name === "escape") return { state: reduce(state, { type: "confirm_mark_all_updates", value: false }), command: null };
     return { state, command: null };
   }
@@ -105,9 +110,9 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     if (name === "up" || name === "k") return { state: reduce(state, { type: "move_update_selection", delta: -1 }), command: null };
     if (name === "down" || name === "j") return { state: reduce(state, { type: "move_update_selection", delta: 1 }), command: null };
     if (name === "u") return { state: reduce(state, { type: "toggle_update_filter" }), command: null };
-    if (name === "m" && !uppercaseM) return { state: reduce(state, { type: "toggle_update_read" }), command: null };
-    if (name === "space" || key.sequence === " " || name === "o") return { state: reduce(state, { type: "toggle_update_expanded" }), command: null };
-    if (uppercaseM) return { state: reduce(state, { type: "request_mark_all_updates" }), command: null };
+    if (name === "m" && !uppercaseM) return updateMutation(state, { type: "toggle_update_read" });
+    if (name === "space" || key.sequence === " " || name === "o") return updateMutation(state, { type: "toggle_update_expanded" });
+    if (uppercaseM) return updateMutation(state, { type: "request_mark_all_updates" });
     if (name === "r") return { state: reduce(state, { type: "message", message: "Local updates are already current", kind: "info" }), command: null };
     if (name === "enter") return { state: reduce(state, { type: "select_update_issue" }), command: "detail" };
   }
