@@ -43,12 +43,16 @@ notifications. `Enter` selects an update's issue and opens its existing read-onl
 Open Settings with `4`; press `f`, then `y`, to remove the saved keychain login without ending the
 current Jira session.
 
-Settings appearance controls are local previews until explicitly saved: use `j`/`k` (or arrows) to
-select `Theme`, `No color`, or `ASCII-only`, then press `Space` or `Enter` to preview a change.
-Press `Ctrl-s` to atomically save the draft, `Ctrl-r` to reload saved preferences, or `x` to restore
-the active value. `System` follows the detected terminal theme and falls back to Dark when detection
-is unavailable. The displayed JQL scope and team member count are summaries only; editing them is
-not currently available.
+In Settings, select `Jira scope` and press `Space` or `Enter` to edit the workspace JQL. Typing and
+paste are supported up to 2,000 UTF-8 bytes. `Ctrl-s` validates and refreshes the candidate scope
+before saving it; `Esc` closes the editor or cancels an in-flight save, and `x` restores the active
+scope. A failed switch keeps the current workspace active and retains the attempted JQL for repair.
+
+Appearance controls are local previews until explicitly saved: use `j`/`k` (or arrows) to select
+`Theme`, `No color`, or `ASCII-only`, then press `Space` or `Enter` to preview a change. Press
+`Ctrl-s` to atomically save the draft, `Ctrl-r` to reload saved preferences, or `x` to restore the
+active value. `System` follows the detected terminal theme and falls back to Dark when detection is
+unavailable. Team member configuration is currently shown as a read-only summary.
 
 Credentials never enter argv, renderer snapshots, diagnostics, or cache files. The custom token
 editor is masked and clears its buffer immediately after a connection attempt. On macOS and Linux,
