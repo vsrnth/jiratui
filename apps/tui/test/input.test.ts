@@ -39,6 +39,30 @@ describe("key handling", () => {
     expect(handleKey(state, { name: "linefeed", sequence: "\n" }).command).toBe("connect");
   });
 
+  test("clears the token on Ctrl-G without producing a command", () => {
+    let state = reduce(initialState(), { type: "onboarding_field", field: "token" });
+    state = reduce(state, { type: "onboarding_token", value: "secret-token" });
+    const result = handleKey(state, { name: "g", sequence: "\u0007", ctrl: true });
+    expect(result.command).toBeNull();
+    expect(result.state.onboarding.token.value).toBe("");
+    expect(result.state.events).toHaveLength(0);
+    expect(parseSequence("\u0007")).toEqual({ name: "g", sequence: "\u0007", ctrl: true });
+  });
+
+  test("blocks duplicate connect submits and exposes typed cancellation", () => {
+    let state = reduce(initialState(), { type: "onboarding_field", field: "token" });
+    state = reduce(state, { type: "onboarding_submit_start" });
+    const duplicate = handleKey(state, { name: "return", sequence: "\r" });
+    expect(duplicate.command).toBeNull();
+    expect(duplicate.state).toBe(state);
+
+    const cancelled = handleKey(state, { name: "escape", sequence: "\u001b" });
+    expect(cancelled.command).toBe("cancel_connect");
+    expect(cancelled.state.onboarding.submitting).toBe(false);
+    expect(cancelled.state.onboarding.field).toBe("token");
+    expect(cancelled.state.lastMessage).toBe("Connection cancelled");
+  });
+
   test("OpenTUI's parsed return event triggers connect from a populated token field", async () => {
     const setup = await createTestRenderer({ width: 80, height: 24 });
     let listener: ((event: Parameters<typeof setup.renderer.keyInput.emit>[1]) => void) | null = null;

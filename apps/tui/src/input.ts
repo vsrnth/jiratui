@@ -2,7 +2,7 @@ import { backspaceSecret, deleteSecret, editSecret, moveSecret } from "./secure-
 import { reduce, type Action, type Focus, type RootState } from "./state";
 
 export type KeyLike = { name?: string; sequence?: string; ctrl?: boolean; shift?: boolean; meta?: boolean };
-export type InputCommand = "quit" | "connect" | "refresh" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | null;
+export type InputCommand = "quit" | "connect" | "cancel_connect" | "refresh" | "detail" | "lookup" | "lookup_submit" | "focus_search" | "retry_resize" | "forget_login" | null;
 export type InputResult = { state: RootState; command: InputCommand };
 const focusOrder: Focus[] = ["Nav", "Search", "List", "Detail", "Composer", "Picker", "Settings"];
 
@@ -33,6 +33,12 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
   if (state.phase === "onboarding") {
     const fields: Array<"baseUrl" | "email" | "token" | "remember"> = ["baseUrl", "email", "token", "remember"];
     const fieldIndex = Math.max(0, fields.indexOf(state.onboarding.field));
+    if (key.ctrl && name === "g") return { state: reduce(state, { type: "onboarding_clear_token" }), command: null };
+    if (state.onboarding.submitting) {
+      if (name === "escape") return { state: reduce(state, { type: "onboarding_cancel" }), command: "cancel_connect" };
+      // Do not let duplicate submits or edits race the active connection.
+      return { state, command: null };
+    }
     if (name === "tab") {
       const next = fields[(fieldIndex + (key.shift ? -1 : 1) + fields.length) % fields.length] ?? "baseUrl";
       return { state: reduce(state, { type: "onboarding_field", field: next }), command: null };
@@ -119,6 +125,7 @@ export function parseSequence(sequence: string): KeyLike {
   const table: Record<string, string> = { "\r": "enter", "\n": "enter", "\u007f": "backspace", "\u001b[A": "up", "\u001b[B": "down", "\u001b[C": "right", "\u001b[D": "left", "\u001b[5~": "pageup", "\u001b[6~": "pagedown", "\u001b": "escape", "\t": "tab" };
   const name = table[sequence];
   if (name) return { name, sequence };
+  if (sequence === "\u0007") return { name: "g", sequence, ctrl: true };
   if (sequence.length === 2 && sequence[0] === "\u0003") return { name: "c", sequence, ctrl: true };
   if (sequence.length === 2 && sequence[0] === "\u000c") return { name: "l", sequence, ctrl: true };
   const result: KeyLike = { sequence };

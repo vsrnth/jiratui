@@ -53,7 +53,8 @@ function onboarding(ctx: Context, state: RootState): BoxRenderable {
     add(row, text(ctx, value || "(required)", { fg: value ? C.fg : C.dim }));
     add(panel, row);
   }
-  add(panel, text(ctx, "Tab/Shift-Tab field   Enter advance/connect   Space toggle remember   Paste supported in token field", { fg: C.dim }));
+  add(panel, text(ctx, "Tab/Shift-Tab field   Enter advance/connect   Space toggle remember", { fg: C.dim }));
+  add(panel, text(ctx, "Ctrl-G clear token   Esc cancel connection   Paste supported in token field", { fg: C.dim }));
   if (state.onboarding.submitting) add(panel, text(ctx, "Checking credentials…", { fg: C.warn }));
   if (state.onboarding.error) add(panel, text(ctx, `Error: ${state.onboarding.error}`, { fg: C.error }));
   return panel;
@@ -198,7 +199,7 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
     add(root, main);
   }
   add(root, footer(renderer, state));
-  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus));
+  if (state.overlays.help) add(root, overlay(renderer, "HELP", ["Navigation", "1 Issues · 2 Updates · 3 Team · 4 Settings", "↑/↓ or j/k Move selection", "Tab/Shift-Tab Move focus", "Enter Open issue / submit onboarding", "Ctrl-G Clear onboarding token · Esc cancel connection", "/ Search locally", "s Status filter · Space toggle · Enter apply · Esc cancel", "l Exact issue-key lookup", "r Refresh from Jira", "f Forget saved login (Settings)", "e Event log", "q Quit", "All Jira operations are read-only."], state.focus));
   if (state.overlays.eventLog) add(root, overlay(renderer, "EVENT LOG", state.events.map((item) => `${item.at} ${item.kind}: ${item.message}`), state.focus));
   if (state.focus === "Picker" && state.pickerMode === "status") add(root, statusPicker(renderer, state));
   renderer.root.add(root);

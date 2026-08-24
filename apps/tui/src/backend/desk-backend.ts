@@ -57,25 +57,35 @@ export class JiraDeskBackend {
 
   async connect(credentials: BackendCredentials, signal?: AbortSignal): Promise<BackendSnapshot> {
     if (!credentials.email || !credentials.token) throw new BackendError("invalid_input", "Email and API token are required");
+    throwIfAborted(signal);
     let siteConfig: JiraHttpConfig;
     try { siteConfig = JiraHttpConfig.parse(credentials.baseUrl); } catch (error) { throw mapError(error); }
     let cloudId: string;
-    try { cloudId = credentials.cloudId ?? await this.#cloudIdDiscovery(siteConfig.siteUrl.href, signal); } catch (error) { throw mapError(error, "Jira Cloud ID could not be discovered"); }
+    try { cloudId = credentials.cloudId ?? await this.#cloudIdDiscovery(siteConfig.siteUrl.href, signal); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapError(error, "Jira Cloud ID could not be discovered"); }
+    throwIfAborted(signal);
     let config: JiraHttpConfig;
     try { config = JiraHttpConfig.parse(credentials.baseUrl, cloudId); } catch (error) { throw mapError(error); }
     const siteId = credentials.siteId?.trim() || config.siteUrl.hostname;
     let jira: JiraReadPort;
     try { jira = this.#jiraFactory(credentials.baseUrl, credentials.email, credentials.token, cloudId); } catch (error) { throw mapError(error); }
+    throwIfAborted(signal);
     let workspace: Workspace;
-    try { workspace = await Workspace.connect(jira, this.#cache, { siteId, siteLabel: siteId }, signal); } catch (error) { throw mapWorkspaceError(error); }
-    this.#workspace = workspace;
+    try { workspace = await Workspace.connect(jira, this.#cache, { siteId, siteLabel: siteId }, signal); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
+    throwIfAborted(signal);
     const storedCredentials: CredentialParts = { baseUrl: credentials.baseUrl, email: credentials.email, token: credentials.token, siteId, cloudId };
     let snapshot = toBackendSnapshot(workspace.initialSnapshot());
-    if (snapshot.issues.length === 0) snapshot = await this.refresh(signal);
+    if (snapshot.issues.length === 0) {
+      try { snapshot = toBackendSnapshot(await workspace.refresh(undefined, signal)); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
+    }
+    throwIfAborted(signal);
     if (credentials.remember) {
+      throwIfAborted(signal);
       const saved = await this.#credentialStore.save(storedCredentials);
+      throwIfAborted(signal);
       if (saved.kind === "unavailable") snapshot = { ...snapshot, warning: "Connected, but secure login could not be saved" };
     }
+    throwIfAborted(signal);
+    this.#workspace = workspace;
     return snapshot;
   }
 
@@ -110,6 +120,14 @@ export class JiraDeskBackend {
 
 function toBackendSnapshot(snapshot: WorkspaceSnapshot): BackendSnapshot {
   return { siteLabel: snapshot.siteLabel, identity: snapshot.identity.displayName, issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt };
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw cancelledError();
+}
+
+function cancelledError(): BackendError {
+  return new BackendError("cancelled", "Connection cancelled");
 }
 
 function mapWorkspaceError(error: unknown): BackendError {

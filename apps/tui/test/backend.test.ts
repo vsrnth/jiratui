@@ -111,6 +111,89 @@ describe("JiraDeskBackend", () => {
     backend.close();
   });
 
+  test("does not publish a workspace when connect is aborted after its initial refresh", async () => {
+    const fixtureData = fixture();
+    const controller = new AbortController();
+    const jira = {
+      async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+      async searchAssignedOrWatched(options: { signal?: AbortSignal }) {
+        options.signal?.throwIfAborted?.();
+        controller.abort();
+        return [summary];
+      },
+      async issueDetail() { return detail; },
+    };
+    const credentialStore = {
+      async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; },
+      async save() { return { kind: "ok", value: true } as const; },
+      async delete() { return { kind: "ok", value: true } as const; },
+    } as unknown as SystemCredentialStore;
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, jiraFactory: () => jira });
+
+    await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false }, controller.signal)).rejects.toMatchObject({ category: "cancelled", message: "Connection cancelled" });
+    await expect(backend.refresh()).rejects.toMatchObject({ category: "authentication" });
+    await expect(backend.loadDetail("DEV-1")).rejects.toMatchObject({ category: "authentication" });
+    backend.close();
+  });
+
+  test("keeps an existing workspace usable when a replacement connect is cancelled", async () => {
+    const fixtureData = fixture();
+    const replacementController = new AbortController();
+    const originalSummary = { ...summary, summary: "Original workspace ticket" };
+    const replacementSummary = { ...summary, key: "NEW-2" as IssueSummary["key"], summary: "Cancelled replacement ticket" };
+    const originalDetail = { ...detail, description: "Original workspace detail" };
+    const originalJira = {
+      async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+      async searchAssignedOrWatched() { return [originalSummary]; },
+      async issueDetail() { return originalDetail; },
+    };
+    const replacementJira = {
+      async myself() { return { accountId: "acct-2", displayName: "Replacement" }; },
+      async searchAssignedOrWatched() {
+        replacementController.abort();
+        return [replacementSummary];
+      },
+      async issueDetail() { throw new Error("cancelled replacement client was retained"); },
+    };
+    const credentialStore = {
+      async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; },
+      async save() { return { kind: "ok", value: true } as const; },
+      async delete() { return { kind: "ok", value: true } as const; },
+    } as unknown as SystemCredentialStore;
+    const backend = new JiraDeskBackend({
+      cache: fixtureData.cache,
+      credentials: credentialStore,
+      jiraFactory: (_baseUrl, _email, token) => token === "old-token" ? originalJira : replacementJira,
+    });
+
+    const original = await backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "old-token", cloudId: "cloud-123", remember: false });
+    expect(original.issues[0]?.summary).toBe("Original workspace ticket");
+    await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "replacement-token", cloudId: "cloud-123", remember: false }, replacementController.signal)).rejects.toMatchObject({ category: "cancelled" });
+
+    const refreshed = await backend.refresh();
+    expect(refreshed.issues[0]?.summary).toBe("Original workspace ticket");
+    const loaded = await backend.loadDetail("DEV-1");
+    expect(loaded.description).toBe("Original workspace detail");
+    backend.close();
+  });
+
+  test("does not attempt secure save when connect starts already aborted", async () => {
+    const fixtureData = fixture();
+    const controller = new AbortController();
+    controller.abort();
+    let saves = 0;
+    const credentialStore = {
+      async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; },
+      async save() { saves += 1; return { kind: "ok", value: true } as const; },
+      async delete() { return { kind: "ok", value: true } as const; },
+    } as unknown as SystemCredentialStore;
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, jiraFactory: () => fixtureData.jira });
+
+    await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: true }, controller.signal)).rejects.toMatchObject({ category: "cancelled", message: "Connection cancelled" });
+    expect(saves).toBe(0);
+    backend.close();
+  });
+
   test("forgets a saved login through the credential store", async () => {
     const fixtureData = fixture();
     let deletes = 0;

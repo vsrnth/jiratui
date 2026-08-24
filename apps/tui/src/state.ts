@@ -49,7 +49,7 @@ export type RootState = {
   refreshLoading: boolean;
   lastSource: "cache" | "jira" | null;
   lastRefresh: string | null;
-  generations: { refresh: number; detail: number; lookup: number };
+  generations: { connect: number; refresh: number; detail: number; lookup: number };
   overlays: { help: boolean; eventLog: boolean };
   confirmForgetLogin: boolean;
   scroll: { list: number; detail: number; updates: number; team: number; eventLog: number };
@@ -67,7 +67,7 @@ export function initialState(size: TerminalSize = { width: 120, height: 40 }): R
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
     issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
     detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
-    generations: { refresh: 0, detail: 0, lookup: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
+    generations: { connect: 0, refresh: 0, detail: 0, lookup: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
     scroll: { list: 0, detail: 0, updates: 0, team: 0, eventLog: 0 }, events: [], lastMessage: null,
   };
 }
@@ -85,8 +85,10 @@ export type Action =
   | { type: "toggle_remember" }
   | { type: "onboarding_submit_start" }
   | { type: "onboarding_submit_clear" }
-  | { type: "onboarding_error"; message: string }
-  | { type: "authenticated"; siteLabel: string; identity: string }
+  | { type: "onboarding_clear_token" }
+  | { type: "onboarding_cancel" }
+  | { type: "onboarding_error"; message: string; generation?: number }
+  | { type: "authenticated"; siteLabel: string; identity: string; generation?: number }
   | { type: "workspace_snapshot"; siteLabel: string; identity: string; issues: readonly IssueSummary[]; source: "cache" | "jira"; refreshedAt: string; generation: number }
   | { type: "refresh_start" }
   | { type: "refresh_error"; message: string; generation: number }
@@ -157,10 +159,18 @@ export function reduce(state: RootState, action: Action): RootState {
     case "onboarding_backspace": return { ...state, onboarding: { ...state.onboarding, token: backspaceSecret(state.onboarding.token) } };
     case "onboarding_field": return { ...state, onboarding: { ...state.onboarding, field: action.field, error: null } };
     case "toggle_remember": return { ...state, onboarding: { ...state.onboarding, remember: !state.onboarding.remember } };
-    case "onboarding_submit_start": return { ...state, onboarding: { ...state.onboarding, submitting: true, error: null } };
+    case "onboarding_submit_start": return state.onboarding.submitting ? state : { ...state, onboarding: { ...state.onboarding, submitting: true, error: null }, generations: { ...state.generations, connect: state.generations.connect + 1 } };
     case "onboarding_submit_clear": return { ...state, onboarding: { ...state.onboarding, token: emptySecret() } };
-    case "onboarding_error": return { ...state, phase: "onboarding", onboarding: { ...state.onboarding, submitting: false, error: action.message } };
-    case "authenticated": return withEvent({ ...state, phase: "loading", siteLabel: action.siteLabel, identity: action.identity }, "auth", "Authenticated");
+    case "onboarding_clear_token": return { ...state, onboarding: { ...state.onboarding, token: emptySecret(), error: null } };
+    case "onboarding_cancel": return withEvent({ ...state, phase: "onboarding", onboarding: { ...state.onboarding, token: emptySecret(), field: "token", submitting: false, error: null }, generations: { ...state.generations, connect: state.generations.connect + 1 } }, "connect", "Connection cancelled");
+    case "onboarding_error": {
+      if (action.generation !== undefined && action.generation !== state.generations.connect) return state;
+      return { ...state, phase: "onboarding", onboarding: { ...state.onboarding, token: emptySecret(), field: "token", submitting: false, error: action.message } };
+    }
+    case "authenticated": {
+      if (action.generation !== undefined && action.generation !== state.generations.connect) return state;
+      return withEvent({ ...state, phase: "loading", siteLabel: action.siteLabel, identity: action.identity, onboarding: { ...state.onboarding, token: emptySecret(), submitting: false, error: null } }, "auth", "Authenticated");
+    }
     case "workspace_snapshot": {
       if (action.generation !== state.generations.refresh) return state;
       const filtered = filterIssues(action.issues, state.search, state.statusFilter);

@@ -9,6 +9,47 @@ const issues = [
 ];
 
 describe("root reducer", () => {
+  test("clears credentials on failure while retaining URL and email", () => {
+    let state = initialState();
+    state = reduce(state, { type: "onboarding_text", value: "https://example.atlassian.net" });
+    state = reduce(state, { type: "onboarding_field", field: "email" });
+    state = reduce(state, { type: "onboarding_text", value: "ada@example.test" });
+    state = reduce(state, { type: "onboarding_field", field: "token" });
+    state = reduce(state, { type: "onboarding_token", value: "secret-token" });
+    state = reduce(state, { type: "onboarding_submit_start" });
+    const generation = state.generations.connect;
+    state = reduce(state, { type: "onboarding_error", message: "Jira authentication was rejected", generation });
+    expect(state.onboarding.baseUrl).toBe("https://example.atlassian.net");
+    expect(state.onboarding.email).toBe("ada@example.test");
+    expect(state.onboarding.token.value).toBe("");
+    expect(state.onboarding.field).toBe("token");
+    expect(state.onboarding.submitting).toBe(false);
+  });
+
+  test("cancellation advances connect generation and drops stale completion", () => {
+    let state = reduce(initialState(), { type: "onboarding_submit_start" });
+    const generation = state.generations.connect;
+    state = reduce(state, { type: "onboarding_cancel" });
+    expect(state.generations.connect).toBe(generation + 1);
+    expect(state.lastMessage).toBe("Connection cancelled");
+    expect(state.onboarding.field).toBe("token");
+    expect(state.onboarding.submitting).toBe(false);
+    const cancelled = state;
+    expect(reduce(state, { type: "onboarding_error", message: "stale failure", generation })).toEqual(cancelled);
+    expect(reduce(state, { type: "authenticated", siteLabel: "stale", identity: "stale", generation })).toEqual(cancelled);
+  });
+
+  test("authenticated transition clears any onboarding secret and submit state", () => {
+    let state = reduce(initialState(), { type: "onboarding_submit_start" });
+    state = reduce(state, { type: "onboarding_token", value: "secret-token" });
+    const generation = state.generations.connect;
+    state = reduce(state, { type: "authenticated", siteLabel: "site", identity: "Ada", generation });
+    expect(state.phase).toBe("loading");
+    expect(state.onboarding.token.value).toBe("");
+    expect(state.onboarding.submitting).toBe(false);
+    expect(state.onboarding.error).toBeNull();
+  });
+
   test("filters locally and preserves complete key", () => {
     let state = initialState();
     state = reduce(state, { type: "workspace_snapshot", siteLabel: "example.atlassian.net", identity: "Ada", issues, source: "cache", refreshedAt: "now", generation: 0 });

@@ -63,6 +63,7 @@ export async function run(): Promise<void> {
       const result = handleKey(state, key);
       state = result.state; dirty = true; draw();
       if (result.command === "quit") { quit(); return true; }
+      if (result.command === "cancel_connect") { connectController?.abort(); connectController = null; return true; }
       if (result.command === "retry_resize") { dispatch({ type: "resize", size: { width: renderer?.width ?? 1, height: renderer?.height ?? 1 } }); return true; }
       if (result.command === "connect") { void connect(); return true; }
       if (result.command === "refresh") { void refresh(); return true; }
@@ -120,22 +121,26 @@ export async function run(): Promise<void> {
   }
 
   async function connect(): Promise<void> {
+    if (state.onboarding.submitting) return;
     const baseUrl = state.onboarding.baseUrl;
     const email = state.onboarding.email;
     let token = state.onboarding.token.value;
     const remember = state.onboarding.remember;
+    connectController?.abort();
     dispatch({ type: "onboarding_submit_start" });
+    const generation = state.generations.connect;
     // Clear the only renderer-owned secret immediately after submission begins.
     dispatch({ type: "onboarding_submit_clear" });
-    if (!baseUrl || !email || !token) { dispatch({ type: "onboarding_error", message: "URL, email, and token are required" }); return; }
-    connectController?.abort();
+    if (!baseUrl || !email || !token) { dispatch({ type: "onboarding_error", message: "URL, email, and token are required", generation }); token = ""; return; }
     const controller = new AbortController();
     connectController = controller;
+    const isCurrent = (): boolean => !quitting && !controller.signal.aborted && connectController === controller && state.generations.connect === generation;
     try {
       const snapshot = await backend.connect({ baseUrl, email, token, remember }, controller.signal);
       token = "";
-      if (quitting || controller.signal.aborted) return;
-      dispatch({ type: "authenticated", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity) });
+      if (!isCurrent()) return;
+      dispatch({ type: "authenticated", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), generation });
+      if (!isCurrent()) return;
       dispatch({ type: "workspace_snapshot", siteLabel: snapshot.siteLabel, identity: identityLabel(snapshot.identity), issues: snapshot.issues, source: snapshot.source, refreshedAt: snapshot.refreshedAt, generation: state.generations.refresh });
       if (snapshot.warning) dispatch({ type: "message", message: snapshot.warning, kind: "warning" });
       if (snapshot.source === "cache") {
@@ -143,9 +148,12 @@ export async function run(): Promise<void> {
         void refresh(true);
       } else schedulePoll();
     } catch (error) {
+      const message = error instanceof BackendError ? error.message : "Connection failed";
       token = "";
-      if (quitting || controller.signal.aborted) return;
-      dispatch({ type: "onboarding_error", message: error instanceof Error ? error.message : "Connection failed" });
+      if (!isCurrent()) return;
+      dispatch({ type: "onboarding_error", message, generation });
+    } finally {
+      if (connectController === controller) connectController = null;
     }
   }
 
