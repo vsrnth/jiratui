@@ -16,8 +16,9 @@ bun install
 bun start
 ```
 
-The onboarding form masks the token and can save it in the OS keyring. Alternatively provide the
-complete configuration tuple before starting:
+The onboarding form masks the token, accepts paste, and can remember the login securely in the OS
+keyring. `Ctrl-G` clears the token field, and `Esc` cancels an in-flight connection. Alternatively
+provide the complete configuration tuple before starting:
 
 ```sh
 export JIRA_BASE_URL=https://example.atlassian.net
@@ -29,8 +30,13 @@ bun start
 ```
 
 The default view is `(assignee = currentUser() OR watcher = currentUser())`, ordered by newest
-update. Use `/` for local search, `l` for exact-key lookup, `Enter` for detail, `r` to refresh,
-`?` for help, and `q` to quit.
+update. In Issues, use `/` for local search, `s` for the local status filter, `l` for exact-key
+lookup, `Enter` for detail, `r` to refresh, `?` for help, and `q` to quit.
+
+Press `2` for Updates. Its `u` (Unread/All), `m` (toggle read), `M` (mark displayed read),
+`Space`/`o` (expand), and `r` (local status message) controls do not contact Jira. Updates are
+grouped from accepted snapshots, start with a quiet baseline, and currently live in memory for the
+active session. `Enter` selects an update's issue and opens its existing read-only detail view.
 
 Open Settings with `4`; press `f`, then `y`, to remove the saved keychain login without ending the
 current Jira session.
