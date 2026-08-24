@@ -1,6 +1,8 @@
 import { clampIndex, layoutFor, type Layout, type LayoutMode, type TerminalSize } from "./layout";
 import { backspaceSecret, emptySecret, type SecretEditor } from "./secure-input";
 import type { IssueDetail, IssueSummary, StatusCategory } from "./protocol";
+import { applyUpdateSnapshot, emptyUpdateLedger, markAllDisplayedRead, setGroupExpanded, toggleGroupRead, updateGroups, type UpdateFilter, type UpdateGroup, type UpdateLedger } from "./updates/ledger";
+import type { IssueId } from "./domain";
 
 export type Focus = "Nav" | "Search" | "List" | "Detail" | "Composer" | "Picker" | "Settings" | "Help" | "EventLog";
 export type Section = "issues" | "updates" | "team" | "settings";
@@ -49,6 +51,12 @@ export type RootState = {
   refreshLoading: boolean;
   lastSource: "cache" | "jira" | null;
   lastRefresh: string | null;
+  updates: UpdateLedger;
+  updatesBaselineEstablished: boolean;
+  updateFilter: UpdateFilter;
+  selectedUpdateIndex: number;
+  selectedUpdateIssueId: IssueId | null;
+  confirmMarkAllUpdates: boolean;
   generations: { connect: number; refresh: number; detail: number; lookup: number };
   overlays: { help: boolean; eventLog: boolean };
   confirmForgetLogin: boolean;
@@ -67,6 +75,7 @@ export function initialState(size: TerminalSize = { width: 120, height: 40 }): R
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
     issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null,
     detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
+    updates: emptyUpdateLedger(), updatesBaselineEstablished: false, updateFilter: "unread", selectedUpdateIndex: 0, selectedUpdateIssueId: null, confirmMarkAllUpdates: false,
     generations: { connect: 0, refresh: 0, detail: 0, lookup: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
     scroll: { list: 0, detail: 0, updates: 0, team: 0, eventLog: 0 }, events: [], lastMessage: null,
   };
@@ -105,6 +114,13 @@ export type Action =
   | { type: "confirm_forget_login"; value: boolean }
   | { type: "move_selection"; delta: number }
   | { type: "select_issue"; index: number }
+  | { type: "toggle_update_filter" }
+  | { type: "move_update_selection"; delta: number }
+  | { type: "toggle_update_read" }
+  | { type: "toggle_update_expanded" }
+  | { type: "request_mark_all_updates" }
+  | { type: "confirm_mark_all_updates"; value: boolean }
+  | { type: "select_update_issue" }
   | { type: "toggle_help" } | { type: "toggle_event_log" } | { type: "scroll"; delta: number }
   | { type: "message"; message: string; kind?: string };
 
@@ -140,6 +156,18 @@ function selectedIssue(state: RootState, filtered: readonly IssueSummary[]): Roo
   };
 }
 
+export function visibleUpdateGroups(state: RootState): UpdateGroup[] {
+  return updateGroups(state.updates, state.updateFilter);
+}
+
+function selectedUpdate(state: RootState, groups: readonly UpdateGroup[]): RootState {
+  const previousId = state.selectedUpdateIssueId;
+  const preservedIndex = previousId ? groups.findIndex((group) => String(group.issueId) === String(previousId)) : -1;
+  const index = preservedIndex >= 0 ? preservedIndex : clampIndex(state.selectedUpdateIndex, groups.length);
+  const selectedUpdateIssueId = groups[index]?.issueId ?? null;
+  return { ...state, selectedUpdateIndex: index, selectedUpdateIssueId, scroll: { ...state.scroll, updates: Math.max(0, index - 5) } };
+}
+
 export function reduce(state: RootState, action: Action): RootState {
   switch (action.type) {
     case "resize": {
@@ -149,7 +177,7 @@ export function reduce(state: RootState, action: Action): RootState {
     case "theme_mode": return { ...state, detectedTheme: action.mode };
     case "set_theme": return { ...state, theme: action.mode };
     case "set_focus": return { ...state, focus: action.focus };
-    case "set_section": return { ...state, section: action.section, focus: action.section === "issues" ? "List" : action.section === "settings" ? "Settings" : "Nav" };
+    case "set_section": return { ...state, section: action.section, focus: action.section === "issues" || action.section === "updates" ? "List" : action.section === "settings" ? "Settings" : "Nav" };
     case "onboarding_text": {
       const field = state.onboarding.field;
       if (field === "token" || field === "remember") return state;
@@ -169,12 +197,34 @@ export function reduce(state: RootState, action: Action): RootState {
     }
     case "authenticated": {
       if (action.generation !== undefined && action.generation !== state.generations.connect) return state;
-      return withEvent({ ...state, phase: "loading", siteLabel: action.siteLabel, identity: action.identity, onboarding: { ...state.onboarding, token: emptySecret(), submitting: false, error: null } }, "auth", "Authenticated");
+      return withEvent({
+        ...state,
+        phase: "loading",
+        siteLabel: action.siteLabel,
+        identity: action.identity,
+        issues: [],
+        filteredIssues: [],
+        selectedIndex: 0,
+        selectedIssueKey: null,
+        detail: null,
+        detailLoading: false,
+        detailError: null,
+        lastSource: null,
+        lastRefresh: null,
+        updates: emptyUpdateLedger(),
+        updatesBaselineEstablished: false,
+        selectedUpdateIndex: 0,
+        selectedUpdateIssueId: null,
+        confirmMarkAllUpdates: false,
+        onboarding: { ...state.onboarding, token: emptySecret(), submitting: false, error: null },
+        generations: { ...state.generations, refresh: state.generations.refresh + 1, detail: state.generations.detail + 1 },
+      }, "auth", "Authenticated");
     }
     case "workspace_snapshot": {
       if (action.generation !== state.generations.refresh) return state;
       const filtered = filterIssues(action.issues, state.search, state.statusFilter);
-      return withEvent(selectedIssue({ ...state, phase: "ready", siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt }, filtered), "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
+      const updates = applyUpdateSnapshot(state.updates, state.updatesBaselineEstablished ? state.issues : null, [...action.issues], { baseline: !state.updatesBaselineEstablished });
+      return withEvent(selectedUpdate(selectedIssue({ ...state, phase: "ready", siteLabel: action.siteLabel, identity: action.identity, issues: [...action.issues], refreshLoading: false, lastSource: action.source, lastRefresh: action.refreshedAt, updates, updatesBaselineEstablished: true, confirmMarkAllUpdates: false }, filtered), visibleUpdateGroups({ ...state, updates, updatesBaselineEstablished: true })), "refresh", `Loaded ${filtered.length} issues from ${action.source}`);
     }
     case "refresh_start": return { ...state, refreshLoading: true, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_error": return action.generation === state.generations.refresh ? withEvent({ ...state, refreshLoading: false }, "refresh", action.message) : state;
@@ -213,9 +263,58 @@ export function reduce(state: RootState, action: Action): RootState {
       const index = clampIndex(action.index, state.filteredIssues.length);
       return { ...state, selectedIndex: index, selectedIssueKey: state.filteredIssues[index]?.key ?? null };
     }
+    case "toggle_update_filter": {
+      const updateFilter: UpdateFilter = state.updateFilter === "unread" ? "all" : "unread";
+      return selectedUpdate({ ...state, updateFilter }, updateGroups(state.updates, updateFilter));
+    }
+    case "move_update_selection": {
+      const groups = visibleUpdateGroups(state);
+      if (groups.length === 0) return state;
+      const index = clampIndex(state.selectedUpdateIndex + action.delta, groups.length);
+      return { ...state, selectedUpdateIndex: index, selectedUpdateIssueId: groups[index]?.issueId ?? null, scroll: { ...state.scroll, updates: Math.max(0, index - 5) } };
+    }
+    case "toggle_update_read": {
+      const groups = visibleUpdateGroups(state);
+      const group = groups[state.selectedUpdateIndex];
+      if (!group) return state;
+      const nextState = withEvent({ ...state, updates: toggleGroupRead(state.updates, group.issueId, state.issues.map((issue) => issue.id)) }, "updates", `${group.unread ? "Marked read" : "Marked unread"}: ${group.issueKey}`);
+      return selectedUpdate(nextState, visibleUpdateGroups(nextState));
+    }
+    case "toggle_update_expanded": {
+      const groups = visibleUpdateGroups(state);
+      const group = groups[state.selectedUpdateIndex];
+      if (!group) return state;
+      return selectedUpdate({ ...state, updates: setGroupExpanded(state.updates, group.issueId, !group.expanded) }, groups);
+    }
+    case "request_mark_all_updates": {
+      const groups = visibleUpdateGroups(state);
+      const affected = groups.filter((group) => group.unread);
+      if (affected.length === 0) return withEvent(state, "updates", "No unread updates to mark read");
+      if (affected.length > 1) return { ...state, confirmMarkAllUpdates: true };
+      const nextState = withEvent({ ...state, updates: markAllDisplayedRead(state.updates, groups.map((group) => group.issueId), state.issues.map((issue) => issue.id)) }, "updates", "Marked 1 update read");
+      return selectedUpdate(nextState, visibleUpdateGroups(nextState));
+    }
+    case "confirm_mark_all_updates": {
+      if (!action.value) return { ...state, confirmMarkAllUpdates: false };
+      const groups = visibleUpdateGroups(state);
+      const affected = groups.filter((group) => group.unread);
+      if (affected.length === 0) return { ...state, confirmMarkAllUpdates: false };
+      const nextState = withEvent({ ...state, confirmMarkAllUpdates: false, updates: markAllDisplayedRead(state.updates, groups.map((group) => group.issueId), state.issues.map((issue) => issue.id)) }, "updates", `Marked ${affected.length} updates read`);
+      return selectedUpdate(nextState, visibleUpdateGroups(nextState));
+    }
+    case "select_update_issue": {
+      const groups = visibleUpdateGroups(state);
+      const group = groups[state.selectedUpdateIndex];
+      if (!group) return state;
+      const issueIndex = state.filteredIssues.findIndex((issue) => String(issue.id) === String(group.issueId));
+      return { ...state, section: "issues", focus: "Detail", selectedIssueKey: group.issueKey, selectedIndex: issueIndex >= 0 ? issueIndex : state.selectedIndex };
+    }
     case "toggle_help": return { ...state, overlays: { ...state.overlays, help: !state.overlays.help }, focus: state.overlays.help ? "List" : "Help" };
     case "toggle_event_log": return { ...state, overlays: { ...state.overlays, eventLog: !state.overlays.eventLog }, focus: state.overlays.eventLog ? "List" : "EventLog" };
-    case "scroll": return { ...state, scroll: { ...state.scroll, [state.focus === "Detail" ? "detail" : state.overlays.eventLog ? "eventLog" : "list"]: Math.max(0, state.scroll[state.focus === "Detail" ? "detail" : state.overlays.eventLog ? "eventLog" : "list"] + action.delta) } };
+    case "scroll": {
+      const key = state.focus === "Detail" ? "detail" : state.overlays.eventLog ? "eventLog" : state.section === "updates" ? "updates" : "list";
+      return { ...state, scroll: { ...state.scroll, [key]: Math.max(0, state.scroll[key] + action.delta) } };
+    }
     case "message": return withEvent(state, action.kind ?? "info", action.message);
   }
 }

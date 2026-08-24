@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { initialState, reduce } from "../src/state";
+import { initialState, reduce, visibleUpdateGroups } from "../src/state";
 import { parseIssueId, parseIssueKey } from "../src/domain";
 
 const issues = [
@@ -124,6 +124,45 @@ describe("root reducer", () => {
 
     expect(reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issues[1]!], source: "jira", refreshedAt: "stale", generation: 0 })).toEqual(current);
     expect(reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issues[1]!], source: "jira", refreshedAt: "future", generation: 2 })).toEqual(current);
+  });
+  test("establishes a quiet update baseline, then derives later field changes", () => {
+    let state = initialState();
+    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "initial", generation: 0 });
+    expect(state.updates.events).toHaveLength(0);
+    expect(state.updatesBaselineEstablished).toBe(true);
+
+    const changed = { ...issues[0]!, status: "Done", statusCategory: "done" as const, priority: "High", updated: "2026-08-24T01:00:00Z" };
+    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [changed, issues[1]!], source: "jira", refreshedAt: "later", generation: 0 });
+    expect(state.updates.events.map((item) => item.field)).toEqual(["status", "priority"]);
+    expect(visibleUpdateGroups(state)).toHaveLength(1);
+    expect(visibleUpdateGroups(state)[0]?.issueKey).toBe(parseIssueKey("ABC-123"));
+  });
+  test("resets the issue and update view on a replacement authentication", () => {
+    let state = reduce(initialState(), { type: "workspace_snapshot", siteLabel: "old", identity: "old", issues, source: "cache", refreshedAt: "old", generation: 0 });
+    state = reduce(state, { type: "authenticated", siteLabel: "new", identity: "new", generation: state.generations.connect });
+    expect(state.issues).toHaveLength(0);
+    expect(state.detail).toBeNull();
+    expect(state.updates.events).toHaveLength(0);
+    expect(state.updatesBaselineEstablished).toBe(false);
+  });
+  test("supports update filter, read state, expansion, and confirmed mark-all", () => {
+    let state = initialState();
+    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues, source: "cache", refreshedAt: "initial", generation: 0 });
+    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: issues.map((issue, index) => index === 0 ? { ...issue, summary: "Changed", updated: "2026-08-24T01:00:00Z" } : issue), source: "jira", refreshedAt: "later", generation: 0 });
+    expect(visibleUpdateGroups(state)).toHaveLength(1);
+    state = reduce(state, { type: "toggle_update_expanded" });
+    expect(visibleUpdateGroups(state)[0]?.expanded).toBe(true);
+    state = reduce(state, { type: "toggle_update_filter" });
+    expect(state.updateFilter).toBe("all");
+    state = reduce(state, { type: "toggle_update_read" });
+    expect(visibleUpdateGroups(state)[0]?.unread).toBe(false);
+
+    const second = { ...issues[1]!, summary: "Changed too", updated: "2026-08-24T02:00:00Z" };
+    state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [issues[0]!, second], source: "jira", refreshedAt: "later-2", generation: 0 });
+    state = reduce(state, { type: "request_mark_all_updates" });
+    expect(state.confirmMarkAllUpdates).toBe(true);
+    state = reduce(state, { type: "confirm_mark_all_updates", value: true });
+    expect(visibleUpdateGroups(state).every((group) => !group.unread)).toBe(true);
   });
   test("bounds event log and handles explicit overlays", () => {
     let state = initialState();

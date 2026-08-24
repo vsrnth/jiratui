@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { parseIssueId, parseIssueKey, type IssueDetail, type IssueSummary } from "../src/domain";
 import { renderApp } from "../src/render/app";
-import { initialState, reduce } from "../src/state";
+import { initialState, reduce, visibleUpdateGroups } from "../src/state";
 
 const longKey = parseIssueKey("EXTRAORDINARILY_LONG_PROJECT_KEY-123456789");
 const issue: IssueSummary = {
@@ -152,6 +152,35 @@ describe("OpenTUI frames", () => {
         await setup.renderOnce();
         expect(setup.renderer.listenerCount("selection")).toBe(firstListenerCount);
       }
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test("renders grouped local Updates with complete keys, local offset timestamps, generic rows, and collapsed limits", async () => {
+    const setup = await createTestRenderer({ width: 140, height: 48 });
+    try {
+      const base = { ...issue, summary: "Original summary", status: "Open", statusCategory: "to_do" as const, priority: "Low", assignee: "Ada", updated: "2026-08-23T00:00:00Z" };
+      const changed = { ...base, summary: "Changed summary", status: "Done", statusCategory: "done" as const, priority: "High", assignee: "Bea", updated: "2026-08-24T01:02:03+05:30" };
+      let state = reduce(initialState({ width: 140, height: 48 }), { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [base], source: "cache", refreshedAt: "initial", generation: 0 });
+      state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [changed], source: "jira", refreshedAt: "later", generation: 0 });
+      state = reduce(state, { type: "set_section", section: "updates" });
+      expect(visibleUpdateGroups(state)[0]?.rows).toHaveLength(3);
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("LOCAL UPDATES");
+      expect(frame).toContain(longKey);
+      expect(frame).toMatch(/Latest \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})/);
+      expect(frame).toContain("Summary changed");
+      expect(frame).toContain("… 1 more");
+
+      const newIssue = { ...issue, id: parseIssueId("10002"), key: parseIssueKey("OTHER-987654321"), summary: "Newly visible issue", updated: "2026-08-24T02:00:00Z" };
+      state = reduce(state, { type: "workspace_snapshot", siteLabel: "site", identity: "user", issues: [changed, newIssue], source: "jira", refreshedAt: "later-2", generation: 0 });
+      state = reduce(state, { type: "set_section", section: "updates" });
+      renderApp(setup.renderer, state);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Other Jira activity · exact field not available from sync");
     } finally {
       setup.renderer.destroy();
     }

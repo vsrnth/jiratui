@@ -93,8 +93,24 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     if (name === "n" || name === "escape") return { state: reduce(state, { type: "confirm_forget_login", value: false }), command: null };
     return { state, command: null };
   }
+  if (state.confirmMarkAllUpdates) {
+    if (name === "y") return { state: reduce(state, { type: "confirm_mark_all_updates", value: true }), command: null };
+    if (name === "n" || name === "escape") return { state: reduce(state, { type: "confirm_mark_all_updates", value: false }), command: null };
+    return { state, command: null };
+  }
   const sections = { "1": "issues", "2": "updates", "3": "team", "4": "settings" } as const;
   if (name in sections) return { state: reduce(state, { type: "set_section", section: sections[name as keyof typeof sections] }), command: null };
+  if (state.section === "updates") {
+    const uppercaseM = key.sequence === "M" || key.name === "M" || (name === "m" && key.shift === true);
+    if (name === "up" || name === "k") return { state: reduce(state, { type: "move_update_selection", delta: -1 }), command: null };
+    if (name === "down" || name === "j") return { state: reduce(state, { type: "move_update_selection", delta: 1 }), command: null };
+    if (name === "u") return { state: reduce(state, { type: "toggle_update_filter" }), command: null };
+    if (name === "m" && !uppercaseM) return { state: reduce(state, { type: "toggle_update_read" }), command: null };
+    if (name === "space" || key.sequence === " " || name === "o") return { state: reduce(state, { type: "toggle_update_expanded" }), command: null };
+    if (uppercaseM) return { state: reduce(state, { type: "request_mark_all_updates" }), command: null };
+    if (name === "r") return { state: reduce(state, { type: "message", message: "Local updates are already current", kind: "info" }), command: null };
+    if (name === "enter") return { state: reduce(state, { type: "select_update_issue" }), command: "detail" };
+  }
   if (state.section === "settings" && name === "f") {
     return { state: reduce(state, { type: "confirm_forget_login", value: true }), command: null };
   }

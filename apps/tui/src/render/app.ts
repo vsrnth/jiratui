@@ -1,7 +1,8 @@
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer, type Renderable } from "@opentui/core";
 import { maskedSecret } from "../secure-input";
-import { STATUS_CATEGORIES, type RootState } from "../state";
+import { STATUS_CATEGORIES, visibleUpdateGroups, type RootState } from "../state";
 import type { StatusCategory } from "../protocol";
+import { GENERIC_UPDATE_LABEL, type UpdateEvent } from "../updates/ledger";
 
 const C = { fg: "#e6e1d6", dim: "#9b978d", accent: "#7dd3a3", blue: "#8ab4f8", warn: "#f2c97d", error: "#f28b82", bg: "#171817", panel: "#20221f", selected: "#2d3d35", border: "#59635b" };
 
@@ -132,6 +133,57 @@ function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRen
   return scroll;
 }
 
+function updateTimestamp(value: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "Unknown time";
+  const date = new Date(parsed);
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  if (offsetMinutes === 0) return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}Z`;
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offset = `${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${offset}`;
+}
+
+function updateRowLabel(event: UpdateEvent): string {
+  if (event.field === "other") return event.label || GENERIC_UPDATE_LABEL;
+  return `${event.label}: ${event.previousValue ?? "(none)"} → ${event.currentValue ?? "(none)"}`;
+}
+
+function updatesView(ctx: Context, state: RootState): BoxRenderable {
+  const groups = visibleUpdateGroups(state);
+  const unreadCount = visibleUpdateGroups({ ...state, updateFilter: "unread" }).length;
+  const panel = box(ctx, {
+    width: "100%",
+    height: "100%",
+    border: true,
+    borderColor: state.focus === "List" ? C.accent : C.border,
+    title: ` LOCAL UPDATES · ${state.updateFilter.toUpperCase()} · ${unreadCount} unread `,
+    padding: 1,
+  });
+  add(panel, text(ctx, "u Unread/All · m Toggle read · M Mark displayed read · Space/o Expand · Enter Detail · r Local reload", { fg: C.dim, width: "100%", wrapMode: "word" }));
+  if (state.confirmMarkAllUpdates) add(panel, text(ctx, "Mark all displayed updates read?  y Confirm · n/Esc Cancel", { fg: C.warn, width: "100%", wrapMode: "word" }));
+  const scroll = new ScrollBoxRenderable(ctx, { width: "100%", height: "100%", border: false, scrollY: true, flexGrow: 1 });
+  scroll.scrollTop = state.scroll.updates;
+  for (let index = 0; index < groups.length; index += 1) {
+    const group = groups[index];
+    if (!group) continue;
+    const selected = index === state.selectedUpdateIndex;
+    const card = box(ctx, { width: "100%", height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
+    if (selected) card.backgroundColor = C.selected;
+    add(card, text(ctx, `${selected ? "▸" : " "} ${group.unread ? "●" : "○"} ${group.expanded ? "▾" : "▸"} ${group.issueKey}`, { fg: selected ? C.accent : group.unread ? C.warn : C.blue, width: "100%", wrapMode: "char" }));
+    add(card, text(ctx, group.issueSummary, { fg: C.fg, width: "100%", wrapMode: "word" }));
+    add(card, text(ctx, `Latest ${updateTimestamp(group.latestAt)} · ${group.events.length} change${group.events.length === 1 ? "" : "s"}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    for (const event of group.rows) add(card, text(ctx, `  • ${updateRowLabel(event)}`, { fg: event.field === "other" ? C.dim : C.fg, width: "100%", wrapMode: "word" }));
+    if (!group.expanded && group.events.length > group.rows.length) add(card, text(ctx, `  … ${group.events.length - group.rows.length} more (Space/o to expand)`, { fg: C.dim, width: "100%", wrapMode: "word" }));
+    add(scroll, card);
+  }
+  if (groups.length === 0) add(scroll, text(ctx, state.updateFilter === "unread" ? "No unread updates" : "No local updates yet. Refresh Jira to compare a later snapshot.", { fg: C.dim, paddingLeft: 1, width: "100%", wrapMode: "word" }));
+  add(panel, scroll);
+  return panel;
+}
+
 function overlay(ctx: Context, title: string, lines: string[], focus: RootState["focus"]): BoxRenderable {
   const panel = box(ctx, { position: "absolute", top: 2, left: 4, width: "80%", height: "80%", zIndex: 10, backgroundColor: C.bg, border: true, borderColor: C.accent, padding: 1, title: ` ${title} ` });
   add(panel, text(ctx, `Focus: ${focus}   Esc close`, { fg: C.dim }));
@@ -142,6 +194,7 @@ function overlay(ctx: Context, title: string, lines: string[], focus: RootState[
 
 function secondarySection(ctx: Context, state: RootState): BoxRenderable {
   const titles = { updates: "LOCAL UPDATES", team: "TEAM TRACKER", settings: "SETTINGS" } as const;
+  if (state.section === "updates") return updatesView(ctx, state);
   const panel = box(ctx, {
     width: "100%",
     height: "100%",
