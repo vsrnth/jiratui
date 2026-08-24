@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { IssueCache, scopePartitionSiteId } from "../src/storage/cache";
-import { JiraDeskBackend, Workspace } from "../src/backend";
+import { IssueCache, scopePartitionSiteId, teamPartitionSiteId } from "../src/storage/cache";
+import { JiraDeskBackend, TeamWorkspace, Workspace } from "../src/backend";
 import { SystemCredentialStore, type CredentialResult, type SavedCredentials, type SecretProvider } from "../src/storage/credentials";
 import type { IssueDetail, IssueSummary } from "../src/domain";
+import type { JiraTeamReadPort } from "../src/backend/ports";
 import { emptyUpdateLedger, markGroupsRead } from "../src/updates/ledger";
 import { PreferencesStore } from "../src/storage/preferences";
 
@@ -12,6 +13,15 @@ const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const summary: IssueSummary = { id: "1" as IssueSummary["id"], key: "DEV-1" as IssueSummary["key"], summary: "A ticket", status: "Open", statusCategory: "to_do", priority: "Medium", assignee: "Unassigned", updated: "2026-01-01" };
 const detail: IssueDetail = { issue: summary, issueType: "Task", reporter: "Ada", project: "DEV", parent: null, labels: [], dueDate: null, created: "2026-01-01", description: "Description", comments: [], attachments: [], remote: true };
+const teamSummary: IssueSummary = { id: "2" as IssueSummary["id"], key: "TEAM-2" as IssueSummary["key"], summary: "Team ticket", status: "In Progress", statusCategory: "in_progress", priority: "High", assignee: "Grace", updated: "2026-02-01" };
+
+/** Keep all backend fakes honest as the façade requires the team read port. */
+function withTeamPort<T extends object>(jira: T): T & JiraTeamReadPort {
+  const candidate = jira as T & Partial<JiraTeamReadPort>;
+  if (!candidate.resolveTeamMember) candidate.resolveTeamMember = async (identifier: string) => ({ accountId: identifier.includes("@") ? "acct-email" : identifier.trim(), displayName: identifier });
+  if (!candidate.searchTeamIssues) candidate.searchTeamIssues = async () => [];
+  return jira as T & JiraTeamReadPort;
+}
 
 function fixture() {
   const dir = `/tmp/jira-desk-backend-${crypto.randomUUID()}`; dirs.push(dir); mkdirSync(dir, { recursive: true });
@@ -46,8 +56,33 @@ function scopeBackendFixture(results: Record<string, readonly IssueSummary[]>) {
     },
     async issueDetail() { return detail; },
   };
-  const backend = new JiraDeskBackend({ cache, credentials: testCredentials(), env, preferences, jiraFactory: () => jira });
+  const backend = new JiraDeskBackend({ cache, credentials: testCredentials(), env, preferences, jiraFactory: () => withTeamPort(jira) });
   return { dir, env, cache, preferences, jira, backend, calls };
+}
+
+function teamBackendFixture() {
+  const dir = `/tmp/jira-desk-team-backend-${crypto.randomUUID()}`;
+  dirs.push(dir); mkdirSync(dir, { recursive: true });
+  const env = { XDG_DATA_HOME: dir };
+  const cache = new IssueCache(join(dir, "cache.sqlite3"));
+  const preferences = new PreferencesStore(env);
+  const resolved: string[] = [];
+  const teamCalls: string[][] = [];
+  const jira = withTeamPort({
+    async myself() { return { accountId: "acct-1", displayName: "Ada" }; },
+    async searchAssignedOrWatched() { return [summary]; },
+    async issueDetail() { return detail; },
+    async resolveTeamMember(identifier: string) {
+      resolved.push(identifier);
+      return { accountId: identifier.includes("@") ? "acct-email" : identifier.trim(), displayName: identifier };
+    },
+    async searchTeamIssues(accountIds: readonly string[]) {
+      teamCalls.push([...accountIds]);
+      return [teamSummary];
+    },
+  });
+  const backend = new JiraDeskBackend({ cache, credentials: testCredentials(), env, preferences, jiraFactory: () => jira });
+  return { dir, env, cache, preferences, jira, backend, resolved, teamCalls };
 }
 
 describe("Workspace", () => {
@@ -149,6 +184,139 @@ describe("Workspace", () => {
 });
 
 describe("JiraDeskBackend", () => {
+  test("loads a cached canonical team partition without a Jira team call and restores it on restart", async () => {
+    const fixtureData = teamBackendFixture();
+    fixtureData.preferences.save({ teamMembers: ["acct-2"] });
+    const teamSite = teamPartitionSiteId("example.atlassian.net", ["acct-2"]);
+    fixtureData.cache.commitWorkspace({ siteId: teamSite, accountId: "acct-1" }, [teamSummary], emptyUpdateLedger(), true);
+    const first = await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    expect(fixtureData.backend.teamSnapshot()).toMatchObject({ source: "cache", issues: [teamSummary] });
+    expect(fixtureData.teamCalls).toEqual([]);
+    fixtureData.backend.close();
+    const second = new JiraDeskBackend({ cache: new IssueCache(join(fixtureData.dir, "cache.sqlite3")), credentials: testCredentials(), env: fixtureData.env, preferences: new PreferencesStore(fixtureData.env), jiraFactory: () => fixtureData.jira });
+    await second.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    expect(second.teamSnapshot()).toMatchObject({ source: "cache", issues: [teamSummary] });
+    expect(fixtureData.teamCalls).toEqual([]);
+    expect(first.source).toBe("jira");
+    second.close();
+  });
+
+  test("keeps an empty team local and never calls Jira, including refresh", async () => {
+    const fixtureData = teamBackendFixture();
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    expect(fixtureData.backend.teamSnapshot()).toMatchObject({ source: "local", issues: [] });
+    expect(await fixtureData.backend.refreshTeam()).toMatchObject({ source: "local", issues: [] });
+    expect(fixtureData.resolved).toEqual([]);
+    expect(fixtureData.teamCalls).toEqual([]);
+    fixtureData.backend.close();
+  });
+
+  test("refreshes the active team remotely and keeps its update ledger isolated", async () => {
+    const fixtureData = teamBackendFixture();
+    fixtureData.preferences.save({ teamMembers: ["acct-2"] });
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    const refreshed = await fixtureData.backend.refreshTeam();
+    expect(refreshed).toMatchObject({ source: "jira", issues: [teamSummary] });
+    expect(fixtureData.teamCalls).toEqual([["acct-2"]]);
+    const teamState = fixtureData.cache.loadWorkspace({ siteId: teamPartitionSiteId("example.atlassian.net", ["acct-2"]), accountId: "acct-1" });
+    expect(teamState.updates).toEqual(emptyUpdateLedger());
+    expect((await fixtureData.backend.refresh()).updates).toEqual(expect.any(Object));
+    fixtureData.backend.close();
+  });
+
+  test("resolves in input order, deduplicates stable IDs, and saves canonical accounts after cache commit", async () => {
+    const fixtureData = teamBackendFixture();
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    const order: string[] = [];
+    const commit = fixtureData.cache.commitWorkspace.bind(fixtureData.cache);
+    fixtureData.cache.commitWorkspace = ((identity, issues, updates, baseline) => { order.push("cache"); return commit(identity, issues, updates, baseline); }) as typeof fixtureData.cache.commitWorkspace;
+    const save = fixtureData.preferences.save.bind(fixtureData.preferences);
+    fixtureData.preferences.save = ((input) => { order.push("preferences"); return save(input); }) as typeof fixtureData.preferences.save;
+    const result = await fixtureData.backend.applyTeamMembers(["acct-a", "ada@example.test", "acct-a"]);
+    expect(fixtureData.resolved).toEqual(["acct-a", "ada@example.test"]);
+    expect(fixtureData.teamCalls.at(-1)).toEqual(["acct-a", "acct-email"]);
+    expect(result.preferences.teamMembers).toEqual(["acct-a", "acct-email"]);
+    expect(order).toEqual(["cache", "preferences"]);
+    expect(fixtureData.backend.teamSnapshot().source).toBe("jira");
+    fixtureData.backend.close();
+  });
+
+  test("rejects unsafe or oversized raw identifiers locally before any Jira resolution", async () => {
+    const fixtureData = teamBackendFixture();
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    for (const identifiers of [["   "], ["bad\nidentifier"], ["é".repeat(161)], Array.from({ length: 101 }, (_, index) => `acct-${index}`)]) {
+      await expect(fixtureData.backend.applyTeamMembers(identifiers)).rejects.toMatchObject({ category: "invalid_input" });
+    }
+    expect(fixtureData.resolved).toEqual([]);
+    expect(fixtureData.teamCalls).toEqual([]);
+    fixtureData.backend.close();
+  });
+
+  test("retains the active team on resolution, fetch, cache, preference, and cancellation failures", async () => {
+    const fixtureData = teamBackendFixture();
+    await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
+    await fixtureData.backend.applyTeamMembers(["acct-old"]);
+    const before = fixtureData.backend.teamSnapshot();
+    fixtureData.jira.resolveTeamMember = async () => { throw new Error("resolve failed"); };
+    await expect(fixtureData.backend.applyTeamMembers(["acct-new"])).rejects.toMatchObject({ category: "internal" });
+    expect(fixtureData.backend.teamSnapshot()).toEqual(before);
+    fixtureData.jira.resolveTeamMember = async (identifier: string) => ({ accountId: identifier, displayName: identifier });
+    fixtureData.jira.searchTeamIssues = async () => { throw new Error("fetch failed"); };
+    await expect(fixtureData.backend.applyTeamMembers(["acct-new"])).rejects.toMatchObject({ category: "internal" });
+    expect(fixtureData.backend.teamSnapshot()).toEqual(before);
+    fixtureData.jira.searchTeamIssues = async () => [teamSummary];
+    const originalCommit = fixtureData.cache.commitWorkspace.bind(fixtureData.cache);
+    fixtureData.cache.commitWorkspace = (() => { throw new Error("cache failed"); }) as typeof fixtureData.cache.commitWorkspace;
+    await expect(fixtureData.backend.applyTeamMembers(["acct-new"])).rejects.toMatchObject({ category: "storage" });
+    fixtureData.cache.commitWorkspace = originalCommit;
+    const originalSave = fixtureData.preferences.save.bind(fixtureData.preferences);
+    fixtureData.preferences.save = (() => { throw new Error("preferences failed"); }) as typeof fixtureData.preferences.save;
+    await expect(fixtureData.backend.applyTeamMembers(["acct-new"])).rejects.toMatchObject({ category: "internal" });
+    expect(fixtureData.preferences.load().teamMembers).toEqual(["acct-old"]);
+    expect(fixtureData.backend.teamSnapshot()).toEqual(before);
+    fixtureData.preferences.save = originalSave;
+    const controller = new AbortController();
+    fixtureData.jira.resolveTeamMember = async () => { controller.abort(); return { accountId: "acct-cancel", displayName: "Cancel" }; };
+    await expect(fixtureData.backend.applyTeamMembers(["acct-cancel"], controller.signal)).rejects.toMatchObject({ category: "cancelled" });
+    expect(fixtureData.backend.teamSnapshot()).toEqual(before);
+    fixtureData.backend.close();
+  });
+
+  test("guards team operations before authentication and preserves the old replacement connection", async () => {
+    const fixtureData = teamBackendFixture();
+    const unauthenticated = new JiraDeskBackend({ cache: new IssueCache(join(fixtureData.dir, "unauthenticated.sqlite3")), credentials: testCredentials(), env: fixtureData.env, jiraFactory: () => fixtureData.jira });
+    expect(() => unauthenticated.teamSnapshot()).toThrow(expect.objectContaining({ category: "authentication" }));
+    await expect(unauthenticated.refreshTeam()).rejects.toMatchObject({ category: "authentication" });
+    await expect(unauthenticated.applyTeamMembers([])).rejects.toMatchObject({ category: "authentication" });
+    unauthenticated.close();
+    const original = await fixtureData.backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "old", cloudId: "cloud-123", remember: false });
+    const controller = new AbortController();
+    const replacement = withTeamPort({
+      async myself() { return { accountId: "acct-replacement", displayName: "Replacement" }; },
+      async searchAssignedOrWatched() { controller.abort(); return [teamSummary]; },
+      async issueDetail() { return detail; },
+    });
+    const replacementBackend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: testCredentials(), env: fixtureData.env, jiraFactory: (_base, _email, token) => token === "old" ? fixtureData.jira : replacement });
+    await replacementBackend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "old", cloudId: "cloud-123", remember: false });
+    await expect(replacementBackend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "new", cloudId: "cloud-123", remember: false }, controller.signal)).rejects.toMatchObject({ category: "cancelled" });
+    expect((await replacementBackend.refresh()).issues).toEqual(original.issues);
+    replacementBackend.close();
+    fixtureData.backend.close();
+  });
+
+  test("TeamWorkspace applies raw validation without Jira and preserves a committed candidate source", async () => {
+    const fixtureData = teamBackendFixture();
+    const workspace = TeamWorkspace.connect(fixtureData.jira, fixtureData.cache, { siteId: "example.atlassian.net", accountId: "acct-1", memberAccountIds: [] });
+    await expect(workspace.prepareTeamMembers(["bad\u0000id"])).rejects.toMatchObject({ code: "invalid_input" });
+    expect(fixtureData.resolved).toEqual([]);
+    const candidate = await workspace.prepareTeamMembers(["acct-direct"]);
+    expect(candidate.snapshot.source).toBe("jira");
+    const active = workspace.activateTeamMembers(candidate);
+    expect(active.source).toBe("jira");
+    expect(active.refreshedAt).toBe(candidate.snapshot.refreshedAt);
+    fixtureData.cache.close();
+  });
+
   test("connects with persisted scope and reads its opaque partition", async () => {
     const scoped = { ...summary, key: "SCOPE-1" as IssueSummary["key"] };
     const fixtureData = scopeBackendFixture({ default: [summary], "project = DEV": [scoped] });
@@ -279,7 +447,7 @@ describe("JiraDeskBackend", () => {
       credentials: testCredentials(),
       env: fixtureData.env,
       preferences: new PreferencesStore(fixtureData.env),
-      jiraFactory: () => fixtureData.jira,
+      jiraFactory: () => withTeamPort(fixtureData.jira),
     });
     const restored = await second.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "token", cloudId: "cloud-123", remember: false });
     expect(restored.source).toBe("cache");
@@ -360,7 +528,7 @@ describe("JiraDeskBackend", () => {
     dirs.push(dir);
     mkdirSync(dir, { recursive: true });
     const env = { XDG_DATA_HOME: dir };
-    const backend = new JiraDeskBackend({ env, cache: fixtureData.cache, preferences: new PreferencesStore(env), jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ env, cache: fixtureData.cache, preferences: new PreferencesStore(env), jiraFactory: () => withTeamPort(fixtureData.jira) });
     const connected = await backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     backend.saveAppearancePreferences({ theme: "Light", noColor: true, asciiOnly: false });
     const refreshed = await backend.refresh();
@@ -372,7 +540,7 @@ describe("JiraDeskBackend", () => {
   test("connects through a Jira port, returns domain snapshots, and never returns credentials", async () => {
     const fixtureData = fixture();
     const credentialStore = { async load() { return { kind: "ok", value: null } as CredentialResult<SavedCredentials | null>; }, async save() { return { kind: "ok", value: true } as const; }, async delete() { return { kind: "ok", value: true } as const; } } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => withTeamPort(fixtureData.jira) });
     const snapshot = await backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     expect(snapshot.identity).toBe("Ada");
     expect(snapshot.issues[0]?.key as string | undefined).toBe("DEV-1");
@@ -400,7 +568,7 @@ describe("JiraDeskBackend", () => {
       cache: new IssueCache(databasePath),
       credentials: credentialStore,
       env: jiraFixture.env,
-      jiraFactory: () => jira,
+      jiraFactory: () => withTeamPort(jira),
     });
     await first.connect({
       baseUrl: "https://example.atlassian.net",
@@ -417,7 +585,7 @@ describe("JiraDeskBackend", () => {
       cache: new IssueCache(databasePath),
       credentials: credentialStore,
       env: jiraFixture.env,
-      jiraFactory: () => jira,
+      jiraFactory: () => withTeamPort(jira),
     });
     const restored = await second.bootstrap();
     expect(restored.state).toBe("authenticated");
@@ -444,7 +612,7 @@ describe("JiraDeskBackend", () => {
       async save() { return { kind: "ok", value: true } as const; },
       async delete() { return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const first = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, env: { XDG_DATA_HOME: dir }, jiraFactory: () => jira });
+    const first = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, env: { XDG_DATA_HOME: dir }, jiraFactory: () => withTeamPort(jira) });
     await first.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     current = { ...summary, summary: "Changed", updated: "2026-02-01" };
     const changed = await first.refresh();
@@ -452,7 +620,7 @@ describe("JiraDeskBackend", () => {
     first.persistUpdateLedger(read);
     first.close();
 
-    const second = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, env: { XDG_DATA_HOME: dir }, jiraFactory: () => jira });
+    const second = new JiraDeskBackend({ cache: new IssueCache(databasePath), credentials, env: { XDG_DATA_HOME: dir }, jiraFactory: () => withTeamPort(jira) });
     const restored = await second.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false });
     expect(restored.source).toBe("cache");
     expect(restored.updates.events).toHaveLength(1);
@@ -462,7 +630,7 @@ describe("JiraDeskBackend", () => {
 
   test("requires authentication to persist local updates", () => {
     const fixtureData = fixture();
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, env: fixtureData.env, jiraFactory: () => withTeamPort(fixtureData.jira) });
     expect(() => backend.persistUpdateLedger(emptyUpdateLedger())).toThrow(
       expect.objectContaining({ category: "authentication" }),
     );
@@ -480,7 +648,7 @@ describe("JiraDeskBackend", () => {
       cache: fixtureData.cache,
       credentials: credentialStore,
       env: { JIRA_BASE_URL: "https://example.atlassian.net" },
-      jiraFactory: () => fixtureData.jira,
+      jiraFactory: () => withTeamPort(fixtureData.jira),
     });
     await expect(backend.bootstrap()).rejects.toMatchObject({ category: "invalid_input" });
     backend.close();
@@ -503,7 +671,7 @@ describe("JiraDeskBackend", () => {
       async save() { return { kind: "ok", value: true } as const; },
       async delete() { return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => withTeamPort(jira) });
 
     await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: false }, controller.signal)).rejects.toMatchObject({ category: "cancelled", message: "Connection cancelled" });
     await expect(backend.refresh()).rejects.toMatchObject({ category: "authentication" });
@@ -539,7 +707,7 @@ describe("JiraDeskBackend", () => {
       cache: fixtureData.cache,
       credentials: credentialStore,
       env: fixtureData.env,
-      jiraFactory: (_baseUrl, _email, token) => token === "old-token" ? originalJira : replacementJira,
+      jiraFactory: (_baseUrl, _email, token) => token === "old-token" ? withTeamPort(originalJira) : withTeamPort(replacementJira),
     });
 
     const original = await backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "old-token", cloudId: "cloud-123", remember: false });
@@ -563,7 +731,7 @@ describe("JiraDeskBackend", () => {
       async save() { saves += 1; return { kind: "ok", value: true } as const; },
       async delete() { return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => withTeamPort(fixtureData.jira) });
 
     await expect(backend.connect({ baseUrl: "https://example.atlassian.net", email: "ada@example.test", token: "secret-token", cloudId: "cloud-123", remember: true }, controller.signal)).rejects.toMatchObject({ category: "cancelled", message: "Connection cancelled" });
     expect(saves).toBe(0);
@@ -578,7 +746,7 @@ describe("JiraDeskBackend", () => {
       async save() { return { kind: "ok", value: true } as const; },
       async delete() { deletes += 1; return { kind: "ok", value: true } as const; },
     } as unknown as SystemCredentialStore;
-    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => fixtureData.jira });
+    const backend = new JiraDeskBackend({ cache: fixtureData.cache, credentials: credentialStore, env: fixtureData.env, jiraFactory: () => withTeamPort(fixtureData.jira) });
 
     await backend.forgetSavedLogin();
     expect(deletes).toBe(1);

@@ -4,7 +4,8 @@ import { IssueCache } from "../storage/cache";
 import { SystemCredentialStore, type CredentialParts } from "../storage/credentials";
 import { PreferencesStore, PreferencesError, type Preferences, validatePreferences } from "../storage/preferences";
 import { Workspace, WorkspaceError, type WorkspaceScopeCandidate, type WorkspaceSnapshot } from "./workspace";
-import type { JiraReadPort } from "./ports";
+import { TeamWorkspace, TeamWorkspaceError, type TeamMemberCandidate, type TeamSnapshot } from "./team-workspace";
+import type { JiraReadPort, JiraTeamReadPort } from "./ports";
 import type { IssueDetail, IssueSummary } from "../domain";
 import type { UpdateLedger } from "../updates/ledger";
 
@@ -33,7 +34,7 @@ type Dependencies = Readonly<{
   credentials?: SystemCredentialStore;
   preferences?: PreferencesStore;
   env?: Record<string, string | undefined>;
-  jiraFactory?: (baseUrl: string, email: string, token: string, cloudId: string) => JiraReadPort;
+  jiraFactory?: (baseUrl: string, email: string, token: string, cloudId: string) => JiraReadPort & JiraTeamReadPort;
   cloudIdDiscovery?: (baseUrl: string, signal?: AbortSignal) => Promise<string>;
 }>;
 
@@ -43,9 +44,10 @@ export class JiraDeskBackend {
   readonly #credentialStore: SystemCredentialStore;
   readonly #preferences: PreferencesStore;
   readonly #env: Record<string, string | undefined>;
-  readonly #jiraFactory: (baseUrl: string, email: string, token: string, cloudId: string) => JiraReadPort;
+  readonly #jiraFactory: (baseUrl: string, email: string, token: string, cloudId: string) => JiraReadPort & JiraTeamReadPort;
   readonly #cloudIdDiscovery: (baseUrl: string, signal?: AbortSignal) => Promise<string>;
   #workspace: Workspace | null = null;
+  #teamWorkspace: TeamWorkspace | null = null;
 
   constructor(dependencies: Dependencies = {}) {
     try { this.#cache = dependencies.cache ?? IssueCache.openDefault(dependencies.env); } catch (error) { throw new BackendError("storage", "Unable to open the local cache", error); }
@@ -82,7 +84,7 @@ export class JiraDeskBackend {
     let config: JiraHttpConfig;
     try { config = JiraHttpConfig.parse(credentials.baseUrl, cloudId); } catch (error) { throw mapError(error); }
     const siteId = credentials.siteId?.trim() || config.siteUrl.hostname;
-    let jira: JiraReadPort;
+    let jira: JiraReadPort & JiraTeamReadPort;
     try { jira = this.#jiraFactory(credentials.baseUrl, credentials.email, credentials.token, cloudId); } catch (error) { throw mapError(error); }
     throwIfAborted(signal);
     let workspace: Workspace;
@@ -90,6 +92,18 @@ export class JiraDeskBackend {
       ? { siteId, siteLabel: siteId }
       : { siteId, siteLabel: siteId, scope: preferences.jqlScope };
     try { workspace = await Workspace.connect(jira, this.#cache, workspaceConfig, signal); } catch (error) { if (signal?.aborted) throw cancelledError(); throw mapWorkspaceError(error); }
+    throwIfAborted(signal);
+    let teamWorkspace: TeamWorkspace;
+    try {
+      teamWorkspace = TeamWorkspace.connect(jira, this.#cache, {
+        siteId,
+        accountId: workspace.identity.accountId,
+        memberAccountIds: preferences.teamMembers,
+      }, signal);
+    } catch (error) {
+      if (signal?.aborted) throw cancelledError();
+      throw mapTeamWorkspaceError(error);
+    }
     throwIfAborted(signal);
     const storedCredentials: CredentialParts = { baseUrl: credentials.baseUrl, email: credentials.email, token: credentials.token, siteId, cloudId };
     let snapshot = toBackendSnapshot(workspace.initialSnapshot());
@@ -105,6 +119,7 @@ export class JiraDeskBackend {
     }
     throwIfAborted(signal);
     this.#workspace = workspace;
+    this.#teamWorkspace = teamWorkspace;
     return snapshot;
   }
 
@@ -114,6 +129,54 @@ export class JiraDeskBackend {
       if (signal?.aborted) throw cancelledError();
       throw mapWorkspaceError(error);
     }
+  }
+
+  teamSnapshot(): TeamSnapshot {
+    if (!this.#teamWorkspace) throw new BackendError("authentication", "Connect to Jira first");
+    try { return this.#teamWorkspace.snapshot(); } catch (error) { throw mapTeamWorkspaceError(error); }
+  }
+
+  async refreshTeam(signal?: AbortSignal): Promise<TeamSnapshot> {
+    if (!this.#teamWorkspace) throw new BackendError("authentication", "Connect to Jira first");
+    try { return await this.#teamWorkspace.refresh(signal); }
+    catch (error) { if (signal?.aborted) throw cancelledError(); throw mapTeamWorkspaceError(error); }
+  }
+
+  /** Resolve, commit, save canonical IDs, then synchronously activate a team. */
+  async applyTeamMembers(identifiers: readonly string[], signal?: AbortSignal): Promise<{ snapshot: TeamSnapshot; preferences: Preferences }> {
+    let current: Preferences;
+    let normalized: Preferences;
+    try {
+      current = this.#preferences.load();
+      normalized = validatePreferences({ ...current, teamMembers: identifiers });
+    } catch (error) { throw mapPreferencesError(error, "load"); }
+    throwIfAborted(signal);
+    const teamWorkspace = this.#teamWorkspace;
+    if (!teamWorkspace) throw new BackendError("authentication", "Connect to Jira first");
+
+    let candidate: TeamMemberCandidate;
+    try { candidate = await teamWorkspace.prepareTeamMembers(normalized.teamMembers, signal); }
+    catch (error) { if (signal?.aborted) throw cancelledError(); throw mapTeamWorkspaceError(error); }
+    throwIfAborted(signal);
+
+    let saved: Preferences;
+    try {
+      saved = this.#preferences.save({
+        version: normalized.version,
+        jqlScope: current.jqlScope,
+        teamMembers: candidate.accountIds,
+        theme: current.theme,
+        noColor: current.noColor,
+        asciiOnly: current.asciiOnly,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw cancelledError();
+      throw mapPreferencesError(error, "save");
+    }
+    // The candidate cache commit and preference save are both complete before
+    // this synchronous activation; no fallible operation remains in between.
+    const snapshot = teamWorkspace.activateTeamMembers(candidate);
+    return { snapshot, preferences: saved };
   }
 
   /**
@@ -190,7 +253,7 @@ export class JiraDeskBackend {
     } catch (error) { throw mapPreferencesError(error, "save"); }
   }
 
-  close(): void { this.#workspace = null; this.#cache.close(); }
+  close(): void { this.#workspace = null; this.#teamWorkspace = null; this.#cache.close(); }
 
   private environmentCredentials(): BackendCredentials | null {
     const baseUrl = this.#env.JIRA_BASE_URL; const email = this.#env.JIRA_EMAIL; const token = this.#env.JIRA_API_TOKEN;
@@ -227,6 +290,16 @@ function cancelledError(): BackendError {
 function mapWorkspaceError(error: unknown): BackendError {
   if (error instanceof BackendError) return error;
   if (error instanceof WorkspaceError) return error.cause ? mapError(error.cause, error.message) : new BackendError(error.code === "transport" ? "upstream" : error.code, error.message, error);
+  return mapError(error);
+}
+
+function mapTeamWorkspaceError(error: unknown): BackendError {
+  if (error instanceof BackendError) return error;
+  if (error instanceof TeamWorkspaceError) {
+    if (error.code === "transport" && error.cause) return mapError(error.cause, error.message);
+    if (error.code === "transport") return new BackendError("upstream", error.message, error);
+    return new BackendError(error.code, error.message, error);
+  }
   return mapError(error);
 }
 
