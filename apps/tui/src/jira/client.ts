@@ -175,18 +175,23 @@ export class JiraHttpClient {
     for (let page = 0; page < MAX_COMMENT_PAGES; page += 1) {
       const path = `/rest/api/3/issue/${encodeURIComponent(key)}/comment?startAt=${startAt}&maxResults=${COMMENT_PAGE_SIZE}`;
       const payload = await this.requestJson(path, { method: "GET" }, signal);
-      if (payloadRecord(payload).nextPageToken !== undefined && payloadRecord(payload).nextPageToken !== null) throw new JiraError("pagination", "Jira returned ambiguous comment pagination");
-      const values = arrayProperty(payload, "comments", "values");
+      const response = payloadRecord(payload);
+      if (!Array.isArray(response.comments)) throw new JiraError("upstream", "Jira returned an invalid comment page");
+      const values = response.comments;
       if (values.length > COMMENT_PAGE_SIZE) throw new JiraError("pagination", "Jira returned an oversized comment page");
       const responseStart = numberProperty(payload, "startAt");
-      if (responseStart !== undefined && responseStart !== startAt) throw new JiraError("pagination", "Jira comment pagination did not advance");
+      if (responseStart === undefined || !Number.isSafeInteger(responseStart) || responseStart !== startAt) throw new JiraError("pagination", "Jira comment pagination did not advance");
       const total = numberProperty(payload, "total");
-      if (total !== undefined && (!Number.isSafeInteger(total) || total < 0 || total > MAX_COMMENTS)) throw new JiraError("pagination", "Jira returned an invalid comment total");
+      if (total === undefined || !Number.isSafeInteger(total) || total < 0 || total > MAX_COMMENTS || total < startAt) throw new JiraError("pagination", "Jira returned an invalid comment total");
       comments.push(...values.map(mapComment));
       if (comments.length > MAX_COMMENTS) throw new JiraError("pagination", "Jira comments exceeded their limit");
-      if ((total !== undefined && comments.length >= total) || values.length < COMMENT_PAGE_SIZE) return comments.sort(compareCommentsNewestFirst);
+      if (comments.length >= total) {
+        if (comments.length !== total) throw new JiraError("pagination", "Jira returned an invalid comment total");
+        return comments.sort(compareCommentsNewestFirst);
+      }
+      if (values.length === 0) throw new JiraError("pagination", "Jira comment pagination did not advance");
       const next = startAt + values.length;
-      if (next <= startAt || values.length === 0) throw new JiraError("pagination", "Jira comment pagination did not advance");
+      if (next <= startAt) throw new JiraError("pagination", "Jira comment pagination did not advance");
       startAt = next;
     }
     throw new JiraError("pagination", "Jira comment pagination exceeded its limit");

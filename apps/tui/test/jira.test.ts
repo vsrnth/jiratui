@@ -5,11 +5,13 @@ import {
   JiraError,
   JiraHttpClient,
   JiraHttpConfig,
+  MAX_ADF_CHILDREN,
   MAX_JSON_BYTES,
   MAX_SEARCH_RESULTS,
   adfToText,
   assignedOrWatchedJql,
   discoverCloudId,
+  mapComment,
   mapIssueDetail,
   mapTeamMember,
   teamIssuesJql,
@@ -53,6 +55,53 @@ describe("pure Jira mapping", () => {
       { type: "text", text: "Jira", marks: [{ type: "link", attrs: { href: "https://example.test" } }] },
       { type: "mystery" },
     ] }] })).toBe("Jira [link: inert][unsupported Jira content]");
+  });
+
+  test("projects ADF tables as readable ASCII-separated rows", () => {
+    const output = adfToText({
+      type: "doc",
+      content: [{
+        type: "table",
+        content: [
+          { type: "tableRow", content: [
+            { type: "tableHeader", content: [{ type: "paragraph", content: [{ type: "text", text: "Criterion" }] }] },
+            { type: "tableHeader", content: [{ type: "paragraph", content: [{ type: "text", text: "Evidence" }] }] },
+            { type: "tableHeader", content: [{ type: "paragraph", content: [{ type: "text", text: "Notes" }] }] },
+          ] },
+          { type: "tableRow", content: [
+            { type: "tableCell", content: [{ type: "paragraph", content: [{ type: "text", text: "Pass\tcheck\u0001\r\nverified" }, { type: "hardBreak" }, { type: "text", text: "done\u001b now" }] }, { type: "paragraph", content: [{ type: "text", text: "second paragraph" }] }] },
+            { type: "tableCell", content: [{ type: "paragraph", content: [{ type: "text", text: "See docs", marks: [{ type: "link", attrs: { href: "https://example.test" } }] }] }] },
+            { type: "tableCell", content: [] },
+          ] },
+        ],
+      }],
+    });
+    expect(output).toBe("Criterion | Evidence | Notes\nPass check\nverified\ndone now\nsecond paragraph | See docs [link: inert] |");
+    expect(output).not.toContain("[unsupported Jira content]");
+    expect(output).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u);
+  });
+
+  test("bounds table structural children like other ADF content", () => {
+    const output = adfToText({
+      type: "table",
+      content: Array.from({ length: MAX_ADF_CHILDREN + 1 }, (_, index) => ({
+        type: "tableRow",
+        content: [{ type: "tableCell", content: [{ type: "paragraph", content: [{ type: "text", text: String(index) }] }] }],
+      })),
+    });
+    expect(output.split("\n")).toHaveLength(MAX_ADF_CHILDREN);
+  });
+
+  test("maps Jira's comment shape and projects ADF bodies to inert text", () => {
+    const result = mapComment({
+      id: "10000",
+      author: { accountId: "acct-1", active: true, displayName: "Ada" },
+      created: "2021-01-17T12:34:00.000+0000",
+      updated: "2021-01-18T23:45:00.000+0000",
+      body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "A comment" }] }] },
+    });
+    expect(result).toEqual({ id: "10000", author: "Ada", created: "2021-01-17T12:34:00.000+0000", updated: "2021-01-18T23:45:00.000+0000", body: "A comment" });
+    expect(() => mapComment({ id: "", body: { type: "doc" } })).toThrow(JiraError);
   });
 
   test("maps detail into normalized renderer-neutral values", () => {
@@ -131,16 +180,31 @@ describe("Jira HTTP boundary", () => {
   test("uses read-only bounded search and comment pagination", async () => {
     const originalFetch = globalThis.fetch;
     const requests: Request[] = [];
-    globalThis.fetch = (async (input, init) => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
       const body = request.url.endsWith("/search/jql")
         ? { issues: [issue], isLast: true }
         : request.url.includes("/comment?")
-          ? { startAt: 0, total: 2, comments: [
-            { id: "c1", author: { displayName: "Ada" }, body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "old" }] }] }, created: "2026-08-01T00:00:00.000Z", updated: "2026-08-01T00:00:00.000Z" },
-            { id: "c2", author: { displayName: "Ada" }, body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "new" }] }] }, created: "2026-08-02T00:00:00.000Z", updated: "2026-08-02T00:00:00.000Z" },
-          ] }
+          ? (() => {
+            const startAt = Number(new URL(request.url).searchParams.get("startAt"));
+            const count = startAt === 0 ? 100 : 1;
+            return {
+              startAt,
+              total: 101,
+              comments: Array.from({ length: count }, (_, offset) => {
+                const index = startAt + offset;
+                const timestamp = new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString();
+                return {
+                  id: String(10_000 + index),
+                  author: { accountId: "acct-1", active: true, displayName: "Ada" },
+                  body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: `comment-${index}` }] }] },
+                  created: timestamp,
+                  updated: timestamp,
+                };
+              }),
+            };
+          })()
           : issue;
       return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
@@ -149,14 +213,61 @@ describe("Jira HTTP boundary", () => {
       const summaries = await client.searchAssignedOrWatched({ scope: "project = DEV" });
       const detail = await client.issueDetail("DEV-123");
       expect(summaries).toHaveLength(1);
-      expect(detail.comments).toHaveLength(2);
-      expect(detail.comments[0]?.id).toBe("c2");
+      expect(detail.comments).toHaveLength(101);
+      expect(detail.comments[0]?.id).toBe("10100");
+      expect(detail.comments[0]?.body).toBe("comment-100");
       expect(requests.every((request) => request.method === "GET" || request.method === "POST")).toBe(true);
       expect(requests[0]?.url).toStartWith("https://api.atlassian.com/ex/jira/cloud-123/");
       expect(requests.find((request) => request.url.endsWith("/search/jql"))?.method).toBe("POST");
       expect(requests.find((request) => request.url.includes("/issue/"))?.url).toContain("created");
       expect(requests.find((request) => request.url.includes("/comment?"))?.url).toContain("maxResults=100");
+      expect(requests.filter((request) => request.url.includes("/comment?")).map((request) => new URL(request.url).searchParams.get("startAt"))).toEqual(["0", "100"]);
       expect(requests.some((request) => request.method === "PUT" || request.method === "DELETE")).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("rejects absent or invalid Cloud comment arrays instead of silently returning zero", async () => {
+    const originalFetch = globalThis.fetch;
+    const payloads: unknown[] = [{ startAt: 0, total: 0 }, { startAt: 0, total: 0, comments: {} }];
+    globalThis.fetch = (async () => new Response(JSON.stringify(payloads.shift()), { status: 200 })) as unknown as typeof fetch;
+    try {
+      const client = JiraHttpClient.from("https://example.atlassian.net", "ada@example.test", "token", "cloud-123");
+      await expect(client.comments("DEV-123")).rejects.toMatchObject({ category: "upstream" });
+      await expect(client.comments("DEV-123")).rejects.toMatchObject({ category: "upstream" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("continues startAt pagination when Jira serves short nonempty pages", async () => {
+    const originalFetch = globalThis.fetch;
+    const starts: number[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const startAt = Number(new URL(request.url).searchParams.get("startAt"));
+      starts.push(startAt);
+      const count = Math.min(2, 5 - startAt);
+      const comments = Array.from({ length: count }, (_, offset) => {
+        const index = startAt + offset;
+        const timestamp = new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString();
+        return {
+          id: String(20_000 + index),
+          author: { displayName: "Ada" },
+          body: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: `short-${index}` }] }] },
+          created: timestamp,
+          updated: timestamp,
+        };
+      });
+      return new Response(JSON.stringify({ comments, startAt, total: 5, maxResults: 2 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    try {
+      const client = JiraHttpClient.from("https://example.atlassian.net", "ada@example.test", "token", "cloud-123");
+      const result = await client.comments("DEV-123");
+      expect(result).toHaveLength(5);
+      expect(starts).toEqual([0, 2, 4]);
+      expect(result[0]?.id).toBe("20004");
     } finally {
       globalThis.fetch = originalFetch;
     }

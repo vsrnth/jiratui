@@ -96,8 +96,10 @@ export function mapComment(value: unknown): IssueComment {
   const item = record(value);
   const id = stringValue(item, "id");
   if (id === undefined) throw new JiraError("upstream", "Jira returned an invalid comment");
+  const normalizedId = safeDisplay(id, "", 255);
+  if (normalizedId.length === 0) throw new JiraError("upstream", "Jira returned an invalid comment");
   return {
-    id: safeDisplay(id, "", 255),
+    id: normalizedId,
     author: safeDisplay(stringValue(record(item.author), "displayName"), "Unknown author", 255),
     created: safeDisplay(stringValue(item, "created"), "Unknown", 128),
     updated: safeDisplay(stringValue(item, "updated"), "Unknown", 128),
@@ -142,7 +144,23 @@ function nestedName(value: unknown, fallback: string, preferred = "name"): strin
 }
 
 function cleanText(value: string): string {
-  return [...value].filter((char) => !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(char)).join("");
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]!;
+    if (char === "\r") {
+      if (value[index + 1] === "\n") index += 1;
+      output += "\n";
+    } else if (char === "\n") {
+      output += "\n";
+    } else if (char === "\t" || /\p{Cc}/u.test(char)) {
+      // Keep a visible boundary when removing an unsafe control/escape byte.
+      const next = value[index + 1];
+      if (next !== undefined && next !== " " && next !== "\t" && next !== "\r" && next !== "\n" && !output.endsWith(" ") && !output.endsWith("\n")) output += " ";
+    } else {
+      output += char;
+    }
+  }
+  return output;
 }
 
 /** Convert Jira ADF to bounded plain text. Links are deliberately inert and visible. */
@@ -165,6 +183,22 @@ export function adfToText(value: unknown): string {
     }
     const item = record(node);
     const kind = stringValue(item, "type") ?? "";
+    if (kind === "table") {
+      const rows = Array.isArray(item.content) ? item.content.slice(0, MAX_ADF_CHILDREN) : [];
+      for (const row of rows) visit(row, depth + 1);
+      return;
+    }
+    if (kind === "tableRow") {
+      const cells = Array.isArray(item.content) ? item.content.slice(0, MAX_ADF_CHILDREN) : [];
+      const renderedCells: string[] = [];
+      for (const cell of cells) {
+        const before = chunks.length;
+        visit(cell, depth + 1);
+        renderedCells.push(chunks.splice(before).join("").replace(/\n+$/u, ""));
+      }
+      chunks.push(renderedCells.join(" | "), "\n");
+      return;
+    }
     if (kind === "text") {
       chunks.push(cleanText(stringValue(item, "text") ?? ""));
       if (arrayValue(item, "marks").some((mark) => stringValue(mark, "type") === "link")) chunks.push(" [link: inert]");
@@ -172,6 +206,7 @@ export function adfToText(value: unknown): string {
     else if (kind === "mention") chunks.push(safeDisplay(stringValue(record(item.attrs), "text"), "@Unknown user", 512));
     else if (kind === "media" || kind === "mediaSingle" || kind === "mediaGroup") chunks.push("[image/attachment]");
     else if (kind === "rule") chunks.push("---\n");
+    else if (kind === "tableCell" || kind === "tableHeader") { /* structural table node */ }
     else if (!["doc", "paragraph", "heading", "bulletList", "orderedList", "listItem", "blockquote", "codeBlock", "panel"].includes(kind)) chunks.push("[unsupported Jira content]");
     const content = Array.isArray(item.content) ? item.content.slice(0, MAX_ADF_CHILDREN) : [];
     for (const child of content) visit(child, depth + 1);
