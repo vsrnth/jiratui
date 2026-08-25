@@ -293,6 +293,57 @@ describe("OpenTUI frames", () => {
     } finally { setup.renderer.destroy(); }
   });
 
+  test("detail End reaches comments and cursor/viewing markers stay distinct", async () => {
+    const setup = await createTestRenderer({ width: 120, height: 40 });
+    try {
+      const second = { ...issue, id: parseIssueId("10002"), key: parseIssueKey("SECOND-2"), summary: "Second" };
+      let state = reduce(initialState({ width: 120, height: 40 }), workspaceSnapshot([issue, second]));
+      state = reduce(state, { type: "set_focus", focus: "Detail" });
+      state = reduce(state, { type: "detail_start", issueKey: longKey });
+      const generation = state.generations.detail;
+      const longDescription = Array.from({ length: 200 }, (_, index) => `description-line-${index + 1} keeps the detail surface scrollable`).join("\n");
+      state = reduce(state, { type: "detail_result", issueKey: longKey, generation, issue: { ...detail, description: longDescription, comments: [{ id: "c", author: "Grace Hopper", created: "now", updated: "now", body: "A reachable comment body." }] } });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      let frame = setup.captureCharFrame();
+      expect(frame).toContain("Comments: 1");
+      expect(frame).not.toContain("COMMENTS (1)");
+      expect(frame).not.toContain("A reachable comment body.");
+
+      state = reduce(state, { type: "detail_scroll", delta: 1 });
+      renderApp(setup.renderer, state); await setup.renderOnce(); await setup.renderOnce();
+      const oneRowFrame = setup.captureCharFrame();
+      expect(oneRowFrame).not.toBe(frame);
+
+      state = reduce(state, { type: "detail_scroll_end" });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      frame = setup.captureCharFrame();
+      expect(frame).toContain("COMMENTS (1)");
+      expect(frame).toContain("A reachable comment body.");
+
+      state = reduce(state, { type: "detail_back" });
+      state = reduce(state, { type: "move_selection", delta: 1 });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      frame = setup.captureCharFrame();
+      expect(frame).toContain("[VIEWING]");
+      expect(frame).toContain("EXTRAORDINARILY_LONG_PROJECT_KEY-123456789");
+      expect(frame).toContain("[SELECTED]");
+      expect(frame).toContain("SECOND-2");
+
+      state = reduce(state, { type: "detail_start", issueKey: "SECOND-2" });
+      const secondGeneration = state.generations.detail;
+      state = reduce(state, {
+        type: "detail_result",
+        issueKey: "SECOND-2",
+        generation: secondGeneration,
+        issue: { ...detail, issue: second, description: "Second detail", comments: [] },
+      });
+      renderApp(setup.renderer, state); await setup.renderOnce();
+      frame = setup.captureCharFrame();
+      expect(frame).toContain("[SELECTED/VIEWING]");
+      expect(frame).toContain("SECOND-2");
+    } finally { setup.renderer.destroy(); }
+  });
+
   test("renders Team empty/loading/error/success states, long keys, and raw Unicode in ASCII mode", async () => {
     const setup = await createTestRenderer({ width: 120, height: 40 });
     try {

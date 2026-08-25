@@ -98,7 +98,7 @@ function titleBar(ctx: Context, state: RootState): BoxRenderable {
 
 function footer(ctx: Context, state: RootState): BoxRenderable {
   const footer = box(ctx, { width: "100%", height: 2, backgroundColor: C.panel, paddingLeft: 1, flexDirection: "row", alignItems: "center" });
-  add(footer, text(ctx, state.lastMessage ?? (state.section === "team" ? "? Help   j/k Select   r Refresh Team   Enter Remote detail   4 Settings   q Quit" : "? Help   e Events   / Search   s Status filter   l Lookup   r Refresh   Enter Detail   q Quit"), { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
+  add(footer, text(ctx, state.lastMessage ?? (state.focus === "Detail" ? "? Help   j/k Scroll   PgUp/PgDn Page   Home/End Bounds   b/Esc Back to list" : state.section === "team" ? "? Help   j/k Select   r Refresh Team   Enter Remote detail   4 Settings   q Quit" : "? Help   e Events   / Search   s Status filter   l Lookup   r Refresh   Enter Detail   q Quit"), { fg: state.lastMessage ? C.accent : C.dim, flexGrow: 1, width: "auto" }));
   add(footer, appText(ctx, `${state.focus} · ${state.layout.mode}`, { fg: C.dim, width: 24 }));
   return footer;
 }
@@ -123,17 +123,18 @@ function onboarding(ctx: Context, state: RootState): BoxRenderable {
 function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRenderable {
   const filterLabel = statusFilterLabel(state.statusFilter);
   const scroll = scrollBox(ctx, { width, height: "100%", border: true, borderColor: state.focus === "List" ? C.accent : C.border, title: ` ISSUES (${state.filteredIssues.length}) ${uiSeparator()} FILTER: ${filterLabel} `, scrollY: true, flexShrink: 0 });
-  scroll.scrollTop = state.scroll.list;
   for (let index = 0; index < state.filteredIssues.length; index += 1) {
     const issue = state.filteredIssues[index];
     if (!issue) continue;
     const selected = index === state.selectedIndex;
+    const viewing = state.detailIssueKey === issue.key;
     // A card layout keeps the identity intact at every supported width. In
     // particular, the key is allowed to wrap instead of being squeezed into a
     // fixed column or replaced with an ellipsis.
     const row = box(ctx, { width: "100%", minWidth: 30, height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
     if (selected && C.selected) row.backgroundColor = C.selected;
-    add(row, appText(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: "100%", wrapMode: "char" }));
+    add(row, appText(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : viewing ? C.warn : C.blue, width: "100%", wrapMode: "char" }));
+    if (selected || viewing) add(row, appText(ctx, viewing && selected ? "[SELECTED/VIEWING]" : viewing ? "[VIEWING]" : "[SELECTED]", { fg: selected ? C.accent : C.warn, width: "100%" }));
     add(row, text(ctx, `${issue.status} ${uiSeparator()} ${issue.priority} ${uiSeparator()} ${issue.assignee}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(row, text(ctx, `Updated ${issue.updated}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
     add(row, text(ctx, issue.summary, { fg: C.fg, width: "100%", wrapMode: "word" }));
@@ -149,6 +150,7 @@ function issueList(ctx: Context, state: RootState, width: number): ScrollBoxRend
           : "No assigned or watched issues";
     add(scroll, text(ctx, empty, { fg: C.dim, paddingLeft: 1, wrapMode: "word", width: "100%" }));
   }
+  scroll.scrollTop = state.scroll.list;
   return scroll;
 }
 
@@ -166,14 +168,32 @@ function statusPicker(ctx: Context, state: RootState): BoxRenderable {
 }
 
 function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRenderable {
-  const scroll = scrollBox(ctx, { width, height: "100%", border: true, borderColor: state.focus === "Detail" ? C.accent : C.border, title: state.detail?.issue.key ? ` ${state.detail.issue.key} ` : " DETAIL ", scrollY: true, flexShrink: 0 });
-  scroll.scrollTop = state.scroll.detail;
-  if (state.detailLoading) { add(scroll, appText(ctx, "Loading issue detail…", { fg: C.warn, paddingLeft: 1 })); return scroll; }
-  if (state.detailError) { add(scroll, text(ctx, state.detailError, { fg: C.error, paddingLeft: 1 })); return scroll; }
-  if (!state.detail) { add(scroll, text(ctx, "Select an issue and press Enter.", { fg: C.dim, paddingLeft: 1 })); return scroll; }
+  const scroll = scrollBox(ctx, { width, height: Math.max(1, state.size.height - 6), minHeight: 0, border: true, borderColor: state.focus === "Detail" ? C.accent : C.border, title: state.detail?.issue.key ? ` ${state.detail.issue.key} ` : " DETAIL ", scrollY: true, flexShrink: 0 });
+  const applyScrollPosition = (): void => {
+    scroll.scrollTop = state.detailScrollAnchor === "end" ? scroll.scrollHeight : state.scroll.detail;
+  };
+  const contentSizeHandler = scroll.content.onSizeChange;
+  scroll.content.onSizeChange = () => {
+    contentSizeHandler?.();
+    applyScrollPosition();
+  };
+  const viewportSizeHandler = scroll.viewport.onSizeChange;
+  scroll.viewport.onSizeChange = () => {
+    viewportSizeHandler?.();
+    applyScrollPosition();
+  };
+  const finish = (): ScrollBoxRenderable => {
+    // Children are present by this point. The content size callback above
+    // reapplies the position after OpenTUI measures the newly attached tree.
+    applyScrollPosition();
+    return scroll;
+  };
+  if (state.detailLoading) { add(scroll, appText(ctx, "Loading issue detail…", { fg: C.warn, paddingLeft: 1 })); return finish(); }
+  if (state.detailError) { add(scroll, text(ctx, state.detailError, { fg: C.error, paddingLeft: 1 })); return finish(); }
+  if (!state.detail) { add(scroll, text(ctx, "Select an issue and press Enter.", { fg: C.dim, paddingLeft: 1 })); return finish(); }
   const detailText = (content: string, color = C.fg, paddingLeft = 1): void => add(scroll, text(ctx, content, { fg: color, paddingLeft, width: "100%", wrapMode: "word" }));
   detailText(state.detail.issue.summary, C.accent);
-  detailText(`${state.detail.remote ? "REMOTE" : "WORKSPACE"} ${uiSeparator()} ${state.detail.issue.key}`, C.blue);
+  detailText(`${state.detail.remote ? "REMOTE" : "WORKSPACE"} ${uiSeparator()} ${state.detail.issue.key} ${uiSeparator()} Comments: ${state.detail.comments.length}`, C.blue);
   detailText(`${state.detail.issue.status} ${uiSeparator()} ${state.detail.issue.priority} ${uiSeparator()} ${state.detail.issue.assignee}`, C.dim);
   detailText(`Type: ${state.detail.issueType}`);
   detailText(`Reporter: ${state.detail.reporter}`);
@@ -189,7 +209,7 @@ function detailView(ctx: Context, state: RootState, width: number): ScrollBoxRen
   for (const comment of state.detail.comments) { detailText(`${comment.author} ${uiSeparator()} ${comment.created}`, C.dim); detailText(comment.body, C.fg, 2); }
   add(scroll, text(ctx, `ATTACHMENTS (${state.detail.attachments.length})`, { fg: C.blue, paddingTop: 1, paddingLeft: 1 }));
   for (const attachment of state.detail.attachments) detailText(`${attachment.filename} ${uiSeparator()} ${attachment.mimeType} ${uiSeparator()} ${attachment.sizeBytes} bytes`, C.dim);
-  return scroll;
+  return finish();
 }
 
 function updateTimestamp(value: string): string {
@@ -227,7 +247,6 @@ function updatesView(ctx: Context, state: RootState): BoxRenderable {
   add(panel, appText(ctx, "u Unread/All · m Toggle read · M Mark displayed read · Space/o Expand · Enter Detail · r Local reload", { fg: C.dim, width: "100%", wrapMode: "word" }));
   if (state.confirmMarkAllUpdates) add(panel, text(ctx, "Mark all displayed updates read?  y Confirm · n/Esc Cancel", { fg: C.warn, width: "100%", wrapMode: "word" }));
   const scroll = scrollBox(ctx, { width: "100%", height: "100%", border: false, scrollY: true, flexGrow: 1 });
-  scroll.scrollTop = state.scroll.updates;
   for (let index = 0; index < groups.length; index += 1) {
     const group = groups[index];
     if (!group) continue;
@@ -242,6 +261,7 @@ function updatesView(ctx: Context, state: RootState): BoxRenderable {
     add(scroll, card);
   }
   if (groups.length === 0) add(scroll, text(ctx, state.updateFilter === "unread" ? "No unread updates" : "No local updates yet. Refresh Jira to compare a later snapshot.", { fg: C.dim, paddingLeft: 1, width: "100%", wrapMode: "word" }));
+  scroll.scrollTop = state.scroll.updates;
   add(panel, scroll);
   return panel;
 }
@@ -263,14 +283,15 @@ function teamView(ctx: Context, state: RootState): BoxRenderable {
   if (state.teamError) add(panel, text(ctx, state.teamError, { fg: C.error, width: "100%", wrapMode: "word" }));
   if (state.teamRefreshedAt) add(panel, text(ctx, `Updated ${state.teamRefreshedAt}`, { fg: C.dim, width: "100%" }));
   const scroll = scrollBox(ctx, { width: "100%", height: "100%", border: false, scrollY: true, flexGrow: 1 });
-  scroll.scrollTop = state.scroll.team;
   for (let index = 0; index < state.teamIssues.length; index += 1) {
     const issue = state.teamIssues[index];
     if (!issue) continue;
     const selected = index === state.teamSelectedIndex;
+    const viewing = state.detailIssueKey === issue.key;
     const row = box(ctx, { width: "100%", height: "auto", paddingTop: 1, paddingBottom: 1, paddingLeft: 1, paddingRight: 1, overflow: "hidden" });
     if (selected && C.selected) row.backgroundColor = C.selected;
-    add(row, appText(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : C.blue, width: "100%", wrapMode: "char" }));
+    add(row, appText(ctx, `${selected ? "▸" : " "} ${issue.key}`, { fg: selected ? C.accent : viewing ? C.warn : C.blue, width: "100%", wrapMode: "char" }));
+    if (selected || viewing) add(row, appText(ctx, viewing && selected ? "[SELECTED/VIEWING]" : viewing ? "[VIEWING]" : "[SELECTED]", { fg: selected ? C.accent : C.warn, width: "100%" }));
     // Jira/user text goes through text(), retaining Unicode even in ASCII mode.
     add(row, text(ctx, issue.summary, { fg: C.fg, width: "100%", wrapMode: "word" }));
     add(row, text(ctx, `${issue.assignee} ${uiSeparator()} ${issue.status}`, { fg: C.dim, width: "100%", wrapMode: "word" }));
@@ -278,6 +299,7 @@ function teamView(ctx: Context, state: RootState): BoxRenderable {
     add(scroll, row);
   }
   if (state.teamIssues.length === 0 && !state.teamLoading && !state.teamError) add(scroll, text(ctx, "No team issues yet. Configure Team members in Settings, then press r to refresh.", { fg: C.dim, width: "100%", wrapMode: "word" }));
+  scroll.scrollTop = state.scroll.team;
   add(panel, scroll);
   return panel;
 }
@@ -394,7 +416,8 @@ export function renderApp(renderer: CliRenderer, state: RootState): void {
       if (state.focus === "Picker" && state.pickerMode !== "status") add(main, text(renderer, `Exact issue key: ${state.lookupEditor || "_"}`, { fg: C.accent, position: "absolute", top: 0, left: 1, zIndex: 5 }));
       if (state.layout.event) {
         const log = scrollBox(renderer, { width: state.layout.event.width, height: "100%", border: true, borderColor: C.border, title: " EVENTS ", scrollY: true, flexShrink: 0 });
-        log.scrollTop = state.scroll.eventLog; for (const item of state.events) add(log, text(renderer, `${item.kind}: ${item.message}`, { fg: C.dim })); add(main, log);
+        for (const item of state.events) add(log, text(renderer, `${item.kind}: ${item.message}`, { fg: C.dim }));
+        log.scrollTop = state.scroll.eventLog; add(main, log);
       }
     }
     add(root, main);

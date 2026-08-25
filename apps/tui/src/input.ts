@@ -175,6 +175,19 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     if (name === "n" || name === "escape") return { state: reduce(state, { type: "confirm_mark_all_updates", value: false }), command: null };
     return { state, command: null };
   }
+  if (state.focus === "Detail") {
+    if (name === "escape" || name === "b") return { state: reduce(state, { type: "detail_back" }), command: null };
+    if (name === "up" || name === "k") return { state: reduce(state, { type: "detail_scroll", delta: -1 }), command: null };
+    if (name === "down" || name === "j") return { state: reduce(state, { type: "detail_scroll", delta: 1 }), command: null };
+    if (name === "pageup" || (name === "u" && key.ctrl)) return { state: reduce(state, { type: "detail_scroll", delta: -10 }), command: null };
+    if (name === "pagedown" || (name === "d" && key.ctrl)) return { state: reduce(state, { type: "detail_scroll", delta: 10 }), command: null };
+    if (name === "home") return { state: reduce(state, { type: "detail_scroll_home" }), command: null };
+    if (name === "end") return { state: reduce(state, { type: "detail_scroll_end" }), command: null };
+    // Issue-list commands do not operate on an already-open detail. Let the
+    // established global handlers below still process quit/help/events,
+    // focus traversal, section switching, and resize retry.
+    if (name === "s" || (name === "l" && !key.ctrl) || name === "r" || name === "enter") return { state, command: null };
+  }
   const sections = { "1": "issues", "2": "updates", "3": "team", "4": "settings" } as const;
   if (name in sections) return { state: reduce(state, { type: "set_section", section: sections[name as keyof typeof sections] }), command: null };
   if (state.section === "settings") {
@@ -228,7 +241,7 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
     if (state.section !== "issues") return { state: reduce(state, { type: "message", message: "This section has no remote refresh", kind: "info" }), command: null };
     return { state: reduce(state, { type: "refresh_start" }), command: "refresh" };
   }
-  if (name === "l") return { state, command: "lookup" };
+  if (name === "l" && !key.ctrl) return { state, command: "lookup" };
   if (name === "enter") {
     if (state.focus === "Picker") return { state, command: "lookup_submit" };
     if (state.section === "issues" && state.phase === "ready" && state.selectedIssueKey) return { state, command: "detail" };
@@ -242,12 +255,14 @@ export function handleKey(state: RootState, key: KeyLike): InputResult {
 
 /** Parse OpenTUI's raw sequence input without putting an unmasked secret in a widget. */
 export function parseSequence(sequence: string): KeyLike {
-  const table: Record<string, string> = { "\r": "enter", "\n": "enter", "\u007f": "backspace", "\u001b[A": "up", "\u001b[B": "down", "\u001b[C": "right", "\u001b[D": "left", "\u001b[5~": "pageup", "\u001b[6~": "pagedown", "\u001b": "escape", "\t": "tab" };
+  const table: Record<string, string> = { "\r": "enter", "\n": "enter", "\u007f": "backspace", "\u001b[A": "up", "\u001b[B": "down", "\u001b[C": "right", "\u001b[D": "left", "\u001b[5~": "pageup", "\u001b[6~": "pagedown", "\u001b[H": "home", "\u001b[F": "end", "\u001b[1~": "home", "\u001b[4~": "end", "\u001b": "escape", "\t": "tab" };
   const name = table[sequence];
   if (name) return { name, sequence };
   if (sequence === "\u0007") return { name: "g", sequence, ctrl: true };
   if (sequence === "\u0012") return { name: "r", sequence, ctrl: true };
   if (sequence === "\u0013") return { name: "s", sequence, ctrl: true };
+  if (sequence === "\u0015") return { name: "u", sequence, ctrl: true };
+  if (sequence === "\u0004") return { name: "d", sequence, ctrl: true };
   if (sequence.length === 2 && sequence[0] === "\u0003") return { name: "c", sequence, ctrl: true };
   if (sequence.length === 2 && sequence[0] === "\u000c") return { name: "l", sequence, ctrl: true };
   const result: KeyLike = { sequence };

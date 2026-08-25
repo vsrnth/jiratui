@@ -86,6 +86,7 @@ export type RootState = {
   detail: IssueDetail | null;
   detailLoading: boolean;
   detailError: string | null;
+  detailScrollAnchor: "top" | "end" | null;
   refreshLoading: boolean;
   lastSource: "cache" | "jira" | null;
   lastRefresh: string | null;
@@ -124,7 +125,7 @@ export function initialState(size: TerminalSize = { width: 120, height: 40 }): R
     siteLabel: null, identity: null,
     onboarding: { baseUrl: "", email: "", token: emptySecret(), remember: true, field: "baseUrl", error: null, submitting: false },
     issues: [], filteredIssues: [], search: "", statusFilter: [], statusDraft: [], statusPickerIndex: 0, pickerMode: null, lookupEditor: "", selectedIndex: 0, selectedIssueKey: null, detailIssueKey: null,
-    detail: null, detailLoading: false, detailError: null, refreshLoading: false, lastSource: null, lastRefresh: null,
+    detail: null, detailLoading: false, detailError: null, detailScrollAnchor: null, refreshLoading: false, lastSource: null, lastRefresh: null,
     teamIssues: [], teamSelectedIndex: 0, teamSelectedIssueId: null, teamLoading: false, teamError: null, teamSource: null, teamRefreshedAt: null,
     updates: emptyUpdateLedger(), updatesBaselineEstablished: false, updateFilter: "unread", selectedUpdateIndex: 0, selectedUpdateIssueId: null, confirmMarkAllUpdates: false,
     generations: { connect: 0, refresh: 0, detail: 0, lookup: 0, scope: 0, team: 0, teamMembers: 0 }, overlays: { help: false, eventLog: false }, confirmForgetLogin: false,
@@ -187,6 +188,10 @@ export type Action =
   | { type: "refresh_error"; message: string; generation: number }
   | { type: "detail_start"; issueKey: string; origin?: "primary" | "team" | "lookup" }
   | { type: "team_detail_start"; issueKey: string }
+  | { type: "detail_scroll"; delta: number }
+  | { type: "detail_scroll_home" }
+  | { type: "detail_scroll_end" }
+  | { type: "detail_back" }
   | { type: "detail_cancel" }
   | { type: "detail_result"; issue: IssueDetail; issueKey: string; generation: number }
   | { type: "detail_error"; message: string; generation: number }
@@ -545,10 +550,14 @@ export function reduce(state: RootState, action: Action): RootState {
     case "refresh_start": return { ...state, refreshLoading: true, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_cancel": return { ...state, refreshLoading: false, generations: { ...state.generations, refresh: state.generations.refresh + 1 } };
     case "refresh_error": return action.generation === state.generations.refresh ? withEvent({ ...state, refreshLoading: false }, "refresh", action.message) : state;
-    case "detail_start": return { ...state, detailLoading: true, detailError: null, selectedIssueKey: action.origin === "team" ? state.selectedIssueKey : action.issueKey, detailIssueKey: action.issueKey, detail: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
-    case "team_detail_start": return { ...state, detailLoading: true, detailError: null, detailIssueKey: action.issueKey, detail: null, focus: "Detail", generations: { ...state.generations, detail: state.generations.detail + 1 } };
-    case "detail_cancel": return { ...state, detailLoading: false, detail: null, detailError: null, detailIssueKey: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
-    case "detail_result": return action.generation === state.generations.detail && action.issueKey === state.detailIssueKey ? { ...state, detailLoading: false, detail: action.issue, detailError: null, scroll: { ...state.scroll, detail: 0 } } : state;
+    case "detail_start": return { ...state, detailLoading: true, detailError: null, detailScrollAnchor: null, focus: "Detail", selectedIssueKey: action.origin === "team" ? state.selectedIssueKey : action.issueKey, detailIssueKey: action.issueKey, detail: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "team_detail_start": return { ...state, detailLoading: true, detailError: null, detailScrollAnchor: null, detailIssueKey: action.issueKey, detail: null, focus: "Detail", generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "detail_cancel": return { ...state, detailLoading: false, detail: null, detailError: null, detailIssueKey: null, detailScrollAnchor: null, generations: { ...state.generations, detail: state.generations.detail + 1 } };
+    case "detail_result": return action.generation === state.generations.detail && action.issueKey === state.detailIssueKey ? { ...state, detailLoading: false, detail: action.issue, detailError: null, detailScrollAnchor: null, scroll: { ...state.scroll, detail: 0 } } : state;
+    case "detail_scroll": return state.focus === "Detail" ? { ...state, detailScrollAnchor: null, scroll: { ...state.scroll, detail: Math.max(0, state.scroll.detail + action.delta) } } : state;
+    case "detail_scroll_home": return state.focus === "Detail" ? { ...state, detailScrollAnchor: "top", scroll: { ...state.scroll, detail: 0 } } : state;
+    case "detail_scroll_end": return state.focus === "Detail" ? { ...state, detailScrollAnchor: "end" } : state;
+    case "detail_back": return state.focus === "Detail" ? { ...state, focus: "List" } : state;
     case "detail_error": return action.generation === state.generations.detail ? withEvent({ ...state, detailLoading: false, detailError: action.message }, "detail", action.message) : state;
     case "set_search": {
       const filtered = filterIssues(state.issues, action.value, state.statusFilter);

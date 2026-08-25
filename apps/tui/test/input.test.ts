@@ -304,6 +304,38 @@ describe("key handling", () => {
     expect(state.detail?.description).toBe("detail");
   });
 
+  test("detail focus owns arrows/pages/boundaries and b/Esc returns without discarding detail", () => {
+    const issue = { id: "1" as never, key: "ABC-1" as never, summary: "Primary", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "now" };
+    let state = reduce(initialState(), workspaceSnapshot([issue]));
+    state = reduce(state, { type: "detail_start", issueKey: "ABC-1" });
+    const generation = state.generations.detail;
+    state = reduce(state, { type: "detail_result", issueKey: "ABC-1", generation, issue: { issue, issueType: "Task", reporter: "Ada", project: "ABC", parent: null, labels: [], dueDate: null, created: "now", description: "long", comments: [], attachments: [], remote: false } });
+    const moved = handleKey(state, { name: "down", sequence: "\u001b[B" }).state;
+    expect(moved.scroll.detail).toBe(1);
+    expect(moved.selectedIssueKey).toBe("ABC-1");
+    expect(handleKey(moved, { name: "pagedown", sequence: "\u001b[6~" }).state.scroll.detail).toBe(11);
+    expect(handleKey(moved, { name: "u", sequence: "\u0015", ctrl: true }).state.scroll.detail).toBe(0);
+    const end = handleKey(moved, { name: "end", sequence: "\u001b[F" }).state;
+    expect(end.detailScrollAnchor).toBe("end");
+    const home = handleKey(end, { name: "home", sequence: "\u001b[H" }).state;
+    expect(home.detailScrollAnchor).toBe("top");
+    const back = handleKey(home, { name: "b", sequence: "b" }).state;
+    expect(back.focus).toBe("List");
+    expect(back.detail?.description).toBe("long");
+    expect(handleKey(home, { name: "q", sequence: "q" }).command).toBe("quit");
+    expect(handleKey(home, { name: "?", sequence: "?" }).state.overlays.help).toBe(true);
+    expect(handleKey(home, { name: "e", sequence: "e" }).state.overlays.eventLog).toBe(true);
+    expect(handleKey(home, { name: "tab", sequence: "\t" }).state.focus).toBe("Composer");
+    expect(handleKey(home, { name: "1", sequence: "1" }).state.section).toBe("issues");
+    expect(handleKey(home, { name: "2", sequence: "2" }).state.section).toBe("updates");
+    expect(handleKey(home, { name: "l", sequence: "\u000c", ctrl: true }).command).toBe("retry_resize");
+    for (const issueCommand of [{ name: "s", sequence: "s" }, { name: "l", sequence: "l" }, { name: "r", sequence: "r" }]) {
+      const result = handleKey(home, issueCommand);
+      expect(result.command).toBeNull();
+      expect(result.state).toBe(home);
+    }
+  });
+
   test("Team Enter emits dedicated remote-detail command without primary membership mutation", () => {
     const teamIssue = { id: "team-1" as never, key: "TEAM-9" as never, summary: "Team issue", status: "Open", statusCategory: "to_do" as const, priority: "High", assignee: "Ada", updated: "now" };
     const primary = { id: "primary-1" as never, key: "ABC-1" as never, summary: "Primary", status: "Open", statusCategory: "to_do" as const, priority: "Medium", assignee: "Ada", updated: "now" };

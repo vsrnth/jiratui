@@ -129,6 +129,19 @@ describe("root reducer", () => {
     state = reduce(state, { type: "detail_result", issueKey: "ABC-123", generation: 1, issue: { issue: issues[0]!, issueType: "Task", reporter: "Ada", project: "ABC", parent: null, labels: [], dueDate: null, created: "2026-08-20", description: "new", comments: [], attachments: [], remote: false } });
     expect(state.detail?.description).toBe("new");
   });
+
+  test("keeps cursor selection distinct from the issue currently shown in detail", () => {
+    let state = reduce(initialState(), snapshot(issues));
+    state = reduce(state, { type: "detail_start", issueKey: "ABC-123" });
+    const generation = state.generations.detail;
+    state = reduce(state, { type: "detail_result", issueKey: "ABC-123", generation, issue: { issue: issues[0]!, issueType: "Task", reporter: "Ada", project: "ABC", parent: null, labels: [], dueDate: null, created: "now", description: "A", comments: [], attachments: [], remote: false } });
+    state = reduce(state, { type: "move_selection", delta: 1 });
+    expect(state.selectedIssueKey).toBe("ABC-456");
+    expect(state.detailIssueKey).toBe("ABC-123");
+    expect(state.detail?.issue.key).toBe(parseIssueKey("ABC-123"));
+    state = reduce(state, { type: "detail_start", issueKey: "ABC-456" });
+    expect(state.detailIssueKey).toBe("ABC-456");
+  });
   test("ignores stale and future workspace snapshot generations", () => {
     let state = initialState();
     const canonical = { ...emptyUpdateLedger(), readIssueIds: [issues[0]!.id] };
