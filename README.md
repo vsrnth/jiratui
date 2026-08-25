@@ -35,6 +35,12 @@ lookup, `Enter` for detail, `r` to refresh, `?` for help, and `q` to quit. Movin
 arrows or `j`/`k` focuses the issue list; native scrollbar chrome stays hidden while keyboard
 scrolling remains available.
 
+While issue detail has focus, arrows or `j`/`k` scroll one row, `PageUp`/`PageDown` (or
+`Ctrl-u`/`Ctrl-d`) scroll a page, and `Home`/`End` jump to the bounds. Press `b` or `Esc` to return
+to the list, select another ticket, and press `Enter` to open it. The list labels the cursor as
+`SELECTED` and the ticket displayed in the detail pane as `VIEWING`. Detail includes all visible
+comments returned by Jira, newest first; Jira ADF tables are projected as readable text rows.
+
 Press `2` for Updates. Its `u` (Unread/All), `m` (toggle read), `M` (mark displayed read),
 `Space`/`o` (expand), and `r` (local status message) controls do not contact Jira. Updates are
 grouped from accepted snapshots with a quiet baseline; the bounded ledger and its read/expanded
